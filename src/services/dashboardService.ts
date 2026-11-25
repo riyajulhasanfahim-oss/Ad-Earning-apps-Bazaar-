@@ -5,6 +5,7 @@ import {
   getDoc,
   getDocFromServer,
   getDocsFromServer,
+  increment,
   limit,
   onSnapshot,
   query,
@@ -67,7 +68,7 @@ import {
   maskUsername,
 } from './appService';
 import { mapReferralDoc } from './authService';
-import { checkAdPolicyCompliance, isAdWithinSchedule } from './adNetworkPolicy';
+import { buildPlacementLaunchUrl, checkAdPolicyCompliance, isAdWithinSchedule } from './adNetworkPolicy';
 
 function formatFirestoreTimestamp(ts: unknown): { label: string; millis: number } {
   if (ts instanceof Timestamp) {
@@ -370,6 +371,7 @@ export function subscribeToActiveAdvertisements(
       const items = snap.docs
         .map((d) => mapAdvertisementDoc(d.id, d.data() as Record<string, unknown>))
         .filter((ad) => {
+          if (ad.adId === DAILY_CHECKIN_BONUS_AD_ID) return false;
           const policy = checkAdPolicyCompliance(ad);
           return policy.compliant && isAdWithinSchedule(ad, todayDhaka);
         });
@@ -703,34 +705,26 @@ export async function initiateAdSession(
     );
   }
 
-  // Prefer server-authoritative createAdSession Cloud Function first
+  // Prefer server-authoritative createAdSession Cloud Function first, then same-origin /api/createAdSession
   const currentUser = auth.currentUser;
   if (currentUser) {
+    const isAppLixir =
+      ad.adNetwork.toLowerCase().includes('applixir') ||
+      /^applixir:/i.test(ad.placementOrUrl.trim());
     try {
       const [idToken, appCheckHeaders] = await Promise.all([
         currentUser.getIdToken(),
         getAppCheckTokenHeader(),
       ]);
-      const endpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/createAdSession`;
-      const controller = new AbortController();
-      const timeoutId = window.setTimeout(() => controller.abort(), 10_000);
-      let response: Response;
-      try {
-        response = await fetch(endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${idToken}`,
-            ...appCheckHeaders,
-          },
-          body: JSON.stringify({ adId: ad.adId }),
-          signal: controller.signal,
-        });
-      } finally {
-        window.clearTimeout(timeoutId);
-      }
+      const response = await fetchBackendEndpointWithFallback(
+        'createAdSession',
+        idToken,
+        appCheckHeaders,
+        { adId: ad.adId },
+        10_000,
+      );
 
-      if (response.status !== 404) {
+      if (response && response.status !== 404 && response.status !== 503) {
         const body = (await response.json().catch(() => ({}))) as {
           ok?: boolean;
           sessionId?: string;
@@ -764,28 +758,15 @@ export async function initiateAdSession(
     } catch (err) {
       // Only fall back to Firestore rules-validated session creation if Cloud Function is unreachable (404 / network error)
       // NEVER fall back for AppLixir ads because AppLixir requires backend credentials & S2S postback verification.
-      const isAppLixir =
-        ad.adNetwork.toLowerCase().includes('applixir') ||
-        /^applixir:/i.test(ad.placementOrUrl.trim());
       if (isAppLixir) {
-        if (
-          err instanceof Error &&
-          (err.message.includes('Failed to fetch') ||
-            err.message.includes('NetworkError') ||
-            err.message.includes('fetch'))
-        ) {
+        if (isNetworkOrUnreachableError(err)) {
           throw new Error(
             'AppLixir Rewarded Ads require the deployed Firebase Cloud Functions backend (`createAdSession` & `verifyAdNetworkCallback`). 0 points credited.',
           );
         }
         throw err;
       }
-      if (
-        err instanceof Error &&
-        !err.message.includes('Failed to fetch') &&
-        !err.message.includes('NetworkError') &&
-        !err.message.includes('fetch')
-      ) {
+      if (!isNetworkOrUnreachableError(err)) {
         throw err;
       }
     }
@@ -934,6 +915,531 @@ export interface AdSessionVerificationResult {
   retryable?: boolean;
 }
 
+const cloudFunctionMissingCache = new Set<string>();
+const vercelApiMissingCache = new Set<string>();
+
+function isNetworkOrUnreachableError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  if (err.name === 'AbortError') return false;
+  const msg = err.message.toLowerCase();
+  return (
+    msg.includes('failed to fetch') ||
+    msg.includes('networkerror') ||
+    msg.includes('load failed') ||
+    msg.includes('fetch')
+  );
+}
+
+function getDhakaYesterdayKeyFromToday(todayDhakaKey: string): string {
+  const parts = todayDhakaKey.split('-').map((n) => Number(n));
+  if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) {
+    return getDhakaDateKey(new Date(Date.now() - 86_400_000));
+  }
+  const utcMidnight = Date.UTC(parts[0], parts[1] - 1, parts[2]);
+  const prev = new Date(utcMidnight - 86_400_000);
+  const yyyy = prev.getUTCFullYear();
+  const mm = String(prev.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(prev.getUTCDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+async function fetchBackendEndpointWithFallback(
+  functionName: string,
+  idToken: string,
+  appCheckHeaders: Record<string, string>,
+  payload: Record<string, unknown>,
+  timeoutMs = 10_000,
+): Promise<Response | null> {
+  const cfKey = `${firebaseConfig.projectId}:${functionName}`;
+  if (!cloudFunctionMissingCache.has(cfKey)) {
+    const cfEndpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/${functionName}`;
+    const cfController = new AbortController();
+    const cfTimer = window.setTimeout(() => cfController.abort(), Math.min(timeoutMs, 7_000));
+    try {
+      const cfResp = await fetch(cfEndpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+          ...appCheckHeaders,
+        },
+        body: JSON.stringify(payload),
+        signal: cfController.signal,
+      });
+      if (cfResp.status === 404) {
+        const cloneText = await cfResp.clone().text().catch(() => '');
+        // Google Cloud Functions missing-route 404 returns HTML; JSON SESSION_NOT_FOUND means the function IS deployed
+        if (!cloneText.trim().startsWith('{')) {
+          cloudFunctionMissingCache.add(cfKey);
+        } else {
+          return cfResp;
+        }
+      } else {
+        return cfResp;
+      }
+    } catch (err) {
+      if (isNetworkOrUnreachableError(err)) {
+        // GCP 404 lacks CORS headers -> browser throws TypeError: Failed to fetch
+        cloudFunctionMissingCache.add(cfKey);
+      } else {
+        throw err;
+      }
+    } finally {
+      window.clearTimeout(cfTimer);
+    }
+  }
+
+  // Fallback 2: Same-origin Vercel / Node serverless API (/api/<functionName>)
+  if (typeof window !== 'undefined' && !vercelApiMissingCache.has(functionName)) {
+    const apiController = new AbortController();
+    const apiTimer = window.setTimeout(() => apiController.abort(), timeoutMs);
+    try {
+      const apiResp = await fetch(`/api/${functionName}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+          'X-Firebase-Project-Id': firebaseConfig.projectId,
+          'X-Firestore-Database-Id': firebaseConfig.firestoreDatabaseId || '(default)',
+          ...appCheckHeaders,
+        },
+        body: JSON.stringify(payload),
+        signal: apiController.signal,
+      });
+      const contentType = apiResp.headers.get('content-type') || '';
+      if (apiResp.status === 404 && !contentType.includes('application/json')) {
+        vercelApiMissingCache.add(functionName);
+        return null;
+      }
+      if (apiResp.status === 503) {
+        const body = (await apiResp.clone().json().catch(() => null)) as {
+          backendConfigured?: boolean;
+        } | null;
+        if (body && body.backendConfigured === false) {
+          vercelApiMissingCache.add(functionName);
+          return null;
+        }
+      }
+      return apiResp;
+    } catch (err) {
+      if (isNetworkOrUnreachableError(err)) {
+        return null;
+      }
+      throw err;
+    } finally {
+      window.clearTimeout(apiTimer);
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Admin-authorized atomic Firestore transaction fallback when neither Cloud Functions
+ * nor Vercel Service Account credentials are configured yet.
+ * Enforces >=30s server-clock elapsed check, non-AppLixir gate, daily limits, and Firestore Rules `isAdmin()`.
+ */
+async function verifyAndCreditAdRewardViaAdminFirestore(
+  sessionId: string,
+  uid: string,
+): Promise<AdSessionVerificationResult> {
+  try {
+    const sessionRef = doc(db, 'adSessions', sessionId);
+    const sessionSnap = await getDocFromServer(sessionRef);
+    if (!sessionSnap.exists()) {
+      return {
+        ok: false,
+        status: 'rejected',
+        error: AD_SESSION_ERROR_MESSAGES.SESSION_NOT_FOUND,
+        retryable: false,
+      };
+    }
+
+    const sessionData = sessionSnap.data();
+    if (String(sessionData.userId || '') !== uid) {
+      return {
+        ok: false,
+        status: 'rejected',
+        error: AD_SESSION_ERROR_MESSAGES.SESSION_MISMATCH,
+        retryable: false,
+      };
+    }
+
+    if (sessionData.status === 'completed') {
+      const txId = String(sessionData.transactionId || sessionId);
+      return {
+        ok: true,
+        status: 'completed',
+        rewardPoints: Number(sessionData.expectedRewardPoints || 0),
+        txId,
+      };
+    }
+
+    if (sessionData.status === 'rejected') {
+      return {
+        ok: false,
+        status: 'rejected',
+        error: mapAdSessionErrorMessage(
+          String(sessionData.rejectionReason || 'SESSION_REJECTED'),
+        ),
+        retryable: false,
+      };
+    }
+
+    const adId = String(sessionData.adId || '');
+    const isDailyBonus = adId === DAILY_CHECKIN_BONUS_AD_ID;
+    const adOrBonusSnap = await getDocFromServer(
+      isDailyBonus ? doc(db, 'appSettings', 'dailyBonus') : doc(db, 'advertisements', adId),
+    );
+    if (!adOrBonusSnap.exists()) {
+      return {
+        ok: false,
+        status: 'rejected',
+        error: isDailyBonus
+          ? AD_SESSION_ERROR_MESSAGES.DAILY_BONUS_NOT_CONFIGURED
+          : AD_SESSION_ERROR_MESSAGES.AD_NOT_FOUND,
+        retryable: false,
+      };
+    }
+
+    const adOrBonusData = adOrBonusSnap.data();
+    const adNetworkName = isDailyBonus
+      ? 'Monetag'
+      : String(adOrBonusData.adNetwork || sessionData.adNetwork || 'Monetag');
+    const placementVal = isDailyBonus
+      ? String(adOrBonusData.monetagDirectLinkUrl || '')
+      : String(adOrBonusData.placementOrUrl || '');
+    const isAppLixir =
+      adNetworkName.toLowerCase().includes('applixir') || /^applixir:/i.test(placementVal.trim());
+    if (isAppLixir) {
+      return {
+        ok: false,
+        status: 'backend_unavailable',
+        error: AD_SESSION_ERROR_MESSAGES.APPLIXIR_NOT_CONFIGURED,
+        retryable: false,
+      };
+    }
+
+    const requiredDurationSec = normalizeAdDurationSeconds(
+      isDailyBonus ? adOrBonusData.durationSeconds : adOrBonusData.estimatedDuration,
+    );
+    const createdAtTs = sessionData.createdAt;
+    const createdAtMillis =
+      createdAtTs instanceof Timestamp ? createdAtTs.toDate().getTime() : 0;
+    const elapsedSec = createdAtMillis > 0 ? (Date.now() - createdAtMillis) / 1000 : 0;
+
+    if (elapsedSec < requiredDurationSec) {
+      return {
+        ok: true,
+        status: 'awaiting_timer',
+        remainingSec: Math.max(1, Math.ceil(requiredDurationSec - elapsedSec)),
+      };
+    }
+
+    const dhakaToday = getDhakaDateKey();
+    const providerTxId = `timer_${sessionId}`.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 110);
+    const completionId = `comp_${providerTxId}`.slice(0, 120);
+    const txId = `tx_${providerTxId}`.slice(0, 120);
+    const ledgerId = `led_${txId}`.slice(0, 120);
+
+    const completionRef = doc(db, 'adCompletions', completionId);
+    const txRef = doc(db, 'transactions', txId);
+    const ledgerRef = doc(db, 'walletLedger', ledgerId);
+    const userRef = doc(db, 'users', uid);
+    const walletRef = doc(db, 'wallets', uid);
+    const dailyLimitRef = doc(db, 'dailyAdLimits', `${uid}_${dhakaToday}`);
+    const dailyBonusUserRef = doc(db, 'dailyBonuses', uid);
+    const walletSettingsRef = doc(db, 'appSettings', 'wallet');
+    const economyRef = doc(db, 'appConfig', 'economy');
+
+    const outcome = await runTransaction(db, async (txn) => {
+      const [
+        completionSnap,
+        txSessionSnap,
+        userSnap,
+        walletSnap,
+        txAdOrBonusSnap,
+        dailyOrBonusUserSnap,
+        txDocSnap,
+        walletSettingsSnap,
+        economySnap,
+      ] = await Promise.all([
+        txn.get(completionRef),
+        txn.get(sessionRef),
+        txn.get(userRef),
+        txn.get(walletRef),
+        txn.get(isDailyBonus ? doc(db, 'appSettings', 'dailyBonus') : doc(db, 'advertisements', adId)),
+        txn.get(isDailyBonus ? dailyBonusUserRef : dailyLimitRef),
+        txn.get(txRef),
+        txn.get(walletSettingsRef),
+        txn.get(economyRef),
+      ]);
+
+      const ws = walletSettingsSnap.exists() ? walletSettingsSnap.data() : {};
+      const ec = economySnap.exists() ? economySnap.data() : {};
+      const earningEnabled = typeof ws.earningEnabled === 'boolean' ? ws.earningEnabled : true;
+      const dailyAdLimit = Math.max(
+        1,
+        Number(ws.dailyAdLimit ?? ec.dailyAdLimit ?? DEFAULT_DAILY_AD_LIMIT),
+      );
+      const rawRate = ws.pointsPerBdt ?? ec.pointsPerBdt ?? null;
+      const pointsPerBdt = typeof rawRate === 'number' && rawRate > 0 ? rawRate : null;
+      const fallbackDailyBonusPoints = Number(ws.dailyBonusPoints ?? ec.dailyBonusPoints ?? 0);
+
+      if (!earningEnabled) throw new Error('EARNING_DISABLED');
+      if (completionSnap.exists() || txDocSnap.exists()) throw new Error('DUPLICATE_PROVIDER_TX');
+      if (!txSessionSnap.exists()) throw new Error('SESSION_NOT_FOUND');
+      const liveSession = txSessionSnap.data();
+      if (liveSession.userId !== uid || liveSession.adId !== adId) {
+        throw new Error('SESSION_MISMATCH');
+      }
+      if (liveSession.status !== 'pending') {
+        throw new Error('SESSION_ALREADY_FINALIZED');
+      }
+      if (!userSnap.exists()) throw new Error('USER_NOT_FOUND');
+      const userData = userSnap.data();
+      if (userData.accountStatus !== 'active') throw new Error('USER_NOT_ACTIVE');
+
+      let rewardPoints = 0;
+      let adName = 'Advertisement';
+      let adNetwork = 'Partner Network';
+      let nextStreakDays = 1;
+      let currentCount = 0;
+      let currentEarned = 0;
+      let completedAdIds: string[] = [];
+
+      if (isDailyBonus) {
+        if (!txAdOrBonusSnap.exists()) throw new Error('DAILY_BONUS_NOT_CONFIGURED');
+        const bonusCfg = txAdOrBonusSnap.data();
+        if (bonusCfg.enabled !== true) throw new Error('AD_INACTIVE');
+        if (bonusCfg.incentivizedTrafficAllowed !== true) {
+          throw new Error('INCENTIVIZED_TRAFFIC_DISALLOWED');
+        }
+        const prevBonus = dailyOrBonusUserSnap.exists() ? dailyOrBonusUserSnap.data() : {};
+        const lastClaimDate = String(prevBonus.lastClaimDate || '');
+        if (lastClaimDate === dhakaToday) {
+          throw new Error('DAILY_BONUS_ALREADY_CLAIMED');
+        }
+        const yesterdayDhaka = getDhakaYesterdayKeyFromToday(dhakaToday);
+        const prevStreak = Math.max(0, Math.floor(Number(prevBonus.streakDays || 0)));
+        nextStreakDays = lastClaimDate === yesterdayDhaka ? prevStreak + 1 : 1;
+        rewardPoints = Math.max(
+          0,
+          Math.floor(Number(bonusCfg.rewardPoints || fallbackDailyBonusPoints || 0)),
+        );
+        if (rewardPoints <= 0) throw new Error('INVALID_REWARD_AMOUNT');
+        adName = 'Daily Check-in Bonus';
+        adNetwork = 'Monetag';
+      } else {
+        if (!txAdOrBonusSnap.exists()) throw new Error('AD_NOT_FOUND');
+        const adData = txAdOrBonusSnap.data();
+        if (adData.status !== 'active') throw new Error('AD_INACTIVE');
+        if (adData.rewardVerificationMethod === 'none') {
+          throw new Error('AD_VERIFICATION_DISABLED');
+        }
+        if (adData.adType === 'direct_link' && adData.incentivizedTrafficAllowed !== true) {
+          throw new Error('INCENTIVIZED_TRAFFIC_DISALLOWED');
+        }
+
+        const existingDaily = dailyOrBonusUserSnap.exists() ? dailyOrBonusUserSnap.data() : null;
+        currentCount = Number(existingDaily?.completedCount || 0);
+        currentEarned = Number(existingDaily?.earnedPoints || 0);
+        completedAdIds = Array.isArray(existingDaily?.completedAdIds)
+          ? existingDaily.completedAdIds.map((x: unknown) => String(x))
+          : [];
+
+        if (currentCount >= dailyAdLimit) throw new Error('GLOBAL_DAILY_LIMIT_REACHED');
+        const perAdLimit = Math.max(1, Number(adData.dailyLimit || 1));
+        if (completedAdIds.filter((id) => id === adId).length >= perAdLimit) {
+          throw new Error('PER_AD_DAILY_LIMIT_REACHED');
+        }
+        rewardPoints = Math.max(0, Number(adData.rewardPoints || 0));
+        if (rewardPoints <= 0) throw new Error('INVALID_REWARD_AMOUNT');
+        adName = String(adData.adName || 'Advertisement');
+        adNetwork = String(adData.adNetwork || 'Partner Network');
+      }
+
+      const w = walletSnap.exists() ? walletSnap.data() : {};
+      const prevTotalPoints = Number(w.totalPoints ?? userData.points ?? 0);
+      const prevReserved = Number(w.reservedPoints ?? 0);
+      const prevAvailable = Number(
+        w.availablePoints ?? Math.max(0, prevTotalPoints - prevReserved),
+      );
+      const prevPending = Number(w.pendingPoints ?? 0);
+      const prevTotalEarned = Number(w.totalEarnedPoints ?? userData.totalEarnings ?? 0);
+      const prevWithdrawnPts = Number(w.totalWithdrawnPoints ?? 0);
+      const prevWithdrawnBdt = Number(w.totalWithdrawnBdt ?? 0);
+
+      const newTotalPoints = prevTotalPoints + rewardPoints;
+      const newAvailablePoints = prevAvailable + rewardPoints;
+      const rateUsed = pointsPerBdt ?? 0;
+      const bdtSnapshot = pointsPerBdt ? Number((rewardPoints / pointsPerBdt).toFixed(2)) : 0;
+      const description = isDailyBonus
+        ? `Daily Check-in Bonus · Day ${nextStreakDays} Streak`
+        : `${adNetwork} · Verified Session ${providerTxId}`;
+      const txType = isDailyBonus ? 'daily_bonus' : 'ad_reward';
+      const nowServer = serverTimestamp();
+
+      txn.set(completionRef, {
+        completionId,
+        providerTxId,
+        sessionId,
+        userId: uid,
+        adId,
+        adName,
+        adNetwork,
+        rewardPoints,
+        transactionId: txId,
+        dhakaDate: dhakaToday,
+        status: 'completed',
+        createdAt: nowServer,
+      });
+
+      txn.update(sessionRef, {
+        status: 'completed',
+        transactionId: txId,
+        rejectionReason: '',
+      });
+
+      if (isDailyBonus) {
+        txn.set(
+          dailyBonusUserRef,
+          {
+            uid,
+            streakDays: nextStreakDays,
+            lastClaimDate: dhakaToday,
+            lastClaimPoints: rewardPoints,
+            updatedAt: nowServer,
+          },
+          { merge: true },
+        );
+      } else {
+        txn.set(
+          dailyLimitRef,
+          {
+            userId: uid,
+            dhakaDate: dhakaToday,
+            completedCount: currentCount + 1,
+            earnedPoints: currentEarned + rewardPoints,
+            completedAdIds: [...completedAdIds, adId],
+            updatedAt: nowServer,
+          },
+          { merge: true },
+        );
+      }
+
+      txn.set(txRef, {
+        transactionId: txId,
+        userId: uid,
+        title: adName,
+        subtitle: description,
+        description,
+        type: txType,
+        direction: 'credit',
+        pointsDelta: rewardPoints,
+        points: rewardPoints,
+        bdtAmount: pointsPerBdt ? bdtSnapshot : null,
+        conversionRateUsed: pointsPerBdt ?? null,
+        status: 'completed',
+        createdAt: nowServer,
+      });
+
+      txn.set(ledgerRef, {
+        entryId: ledgerId,
+        transactionId: txId,
+        userId: uid,
+        entryType: 'credit',
+        transactionType: txType,
+        pointsDelta: rewardPoints,
+        bdtAmount: bdtSnapshot,
+        conversionRateUsed: rateUsed,
+        previousPoints: prevTotalPoints,
+        newPoints: newTotalPoints,
+        previousReservedPoints: prevReserved,
+        newReservedPoints: prevReserved,
+        status: 'completed',
+        description,
+        createdAt: nowServer,
+      });
+
+      txn.set(walletRef, {
+        userId: uid,
+        totalPoints: newTotalPoints,
+        availablePoints: newAvailablePoints,
+        pendingPoints: prevPending,
+        reservedPoints: prevReserved,
+        totalEarnedPoints: prevTotalEarned + rewardPoints,
+        totalWithdrawnPoints: prevWithdrawnPts,
+        totalWithdrawnBdt: prevWithdrawnBdt,
+        updatedAt: nowServer,
+      });
+
+      if (isDailyBonus) {
+        txn.update(userRef, {
+          points: newAvailablePoints,
+          totalEarnings: prevTotalEarned + rewardPoints,
+        });
+      } else {
+        txn.update(userRef, {
+          points: newAvailablePoints,
+          totalEarnings: prevTotalEarned + rewardPoints,
+          totalAdViews: increment(1),
+        });
+      }
+
+      return { rewardPoints, txId };
+    });
+
+    return {
+      ok: true,
+      status: 'completed',
+      rewardPoints: outcome.rewardPoints,
+      txId: outcome.txId,
+    };
+  } catch (err) {
+    const code = err instanceof Error ? err.message : '';
+    if (
+      code.includes('Missing or insufficient permissions') ||
+      code.includes('permission-denied')
+    ) {
+      return {
+        ok: false,
+        status: 'backend_unavailable',
+        error:
+          'Reward verification backend is not configured yet for member accounts. Deploy Firebase Cloud Functions or add FIREBASE_SERVICE_ACCOUNT_JSON in Vercel Environment Variables so customer rewards credit automatically.',
+        retryable: false,
+      };
+    }
+    if (code === 'DUPLICATE_PROVIDER_TX' || code === 'SESSION_ALREADY_FINALIZED') {
+      const latestSnap = await getDocFromServer(doc(db, 'adSessions', sessionId)).catch(
+        () => null,
+      );
+      if (latestSnap?.exists() && latestSnap.data().status === 'completed') {
+        return {
+          ok: true,
+          status: 'completed',
+          rewardPoints: Number(latestSnap.data().expectedRewardPoints || 0),
+          txId: String(latestSnap.data().transactionId || sessionId),
+        };
+      }
+    }
+    if (AD_SESSION_ERROR_MESSAGES[code]) {
+      return {
+        ok: false,
+        status: 'rejected',
+        error: AD_SESSION_ERROR_MESSAGES[code],
+        retryable: false,
+      };
+    }
+    return {
+      ok: false,
+      status: 'error',
+      error: code || 'Could not finalize reward verification.',
+      retryable: true,
+    };
+  }
+}
+
 export async function verifyAdSessionRewardStatus(
   sessionId: string,
 ): Promise<AdSessionVerificationResult> {
@@ -960,21 +1466,19 @@ export async function verifyAdSessionRewardStatus(
     currentUser.getIdToken(),
     getAppCheckTokenHeader(),
   ]);
-  const endpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/verifyAdSessionReward`;
-  const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), 12_000);
 
   try {
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${idToken}`,
-        ...appCheckHeaders,
-      },
-      body: JSON.stringify({ sessionId }),
-      signal: controller.signal,
-    });
+    const response = await fetchBackendEndpointWithFallback(
+      'verifyAdSessionReward',
+      idToken,
+      appCheckHeaders,
+      { sessionId },
+      12_000,
+    );
+
+    if (!response) {
+      return await verifyAndCreditAdRewardViaAdminFirestore(sessionId, currentUser.uid);
+    }
 
     if (response.status === 404) {
       const maybeBody = (await response.json().catch(() => null)) as {
@@ -988,13 +1492,7 @@ export async function verifyAdSessionRewardStatus(
           retryable: false,
         };
       }
-      return {
-        ok: false,
-        status: 'backend_unavailable',
-        error:
-          'Reward verification service (verifyAdSessionReward) is not deployed yet on this Firebase project. Deploy Cloud Functions so Monetag S2S callbacks can verify & credit rewards.',
-        retryable: false,
-      };
+      return await verifyAndCreditAdRewardViaAdminFirestore(sessionId, currentUser.uid);
     }
 
     const body = (await response.json().catch(() => ({}))) as {
@@ -1051,6 +1549,9 @@ export async function verifyAdSessionRewardStatus(
       retryable: errCode === 'RATE_LIMIT_EXCEEDED' || response.status >= 500,
     };
   } catch (err) {
+    if (isNetworkOrUnreachableError(err)) {
+      return await verifyAndCreditAdRewardViaAdminFirestore(sessionId, currentUser.uid);
+    }
     const isAbort = err instanceof Error && err.name === 'AbortError';
     return {
       ok: false,
@@ -1060,8 +1561,6 @@ export async function verifyAdSessionRewardStatus(
         : 'Unable to reach verification server. Please check your connection and retry.',
       retryable: true,
     };
-  } finally {
-    window.clearTimeout(timeoutId);
   }
 }
 
@@ -1079,17 +1578,14 @@ export async function cancelPendingAdSession(
         currentUser.getIdToken(),
         getAppCheckTokenHeader(),
       ]);
-      const endpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/cancelAdSession`;
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${idToken}`,
-          ...appCheckHeaders,
-        },
-        body: JSON.stringify({ sessionId, reason: cleanReason }),
-      });
-      if (response.ok) return;
+      const response = await fetchBackendEndpointWithFallback(
+        'cancelAdSession',
+        idToken,
+        appCheckHeaders,
+        { sessionId, reason: cleanReason },
+        8_000,
+      );
+      if (response && response.ok) return;
     } catch {
       // Fallback to Firestore owner rejection rule below
     }
@@ -2340,6 +2836,40 @@ export async function saveDailyBonusAdConfig(
       );
     }
 
+    // Keep backing advertisements/daily_checkin_bonus doc synced so Firestore adSessions rules pass cleanly
+    const adRef = doc(db, 'advertisements', DAILY_CHECKIN_BONUS_AD_ID);
+    const existingAdSnap = await getDocFromServer(adRef).catch(() => null);
+    if (cleanUrl.length >= 2 || existingAdSnap?.exists()) {
+      const syncStatus: 'active' | 'inactive' =
+        enabled && incentivized && cleanReward >= 1 && /^https:\/\/.+/i.test(cleanUrl)
+          ? 'active'
+          : 'inactive';
+      const createdAtVal = existingAdSnap?.exists()
+        ? existingAdSnap.data().createdAt || serverTimestamp()
+        : serverTimestamp();
+      ops.push(
+        setDoc(adRef, {
+          adId: DAILY_CHECKIN_BONUS_AD_ID,
+          adName: 'Daily Check-in Bonus',
+          adNetwork: 'Monetag',
+          adType: 'direct_link',
+          placementOrUrl: cleanUrl || existingAdSnap?.data()?.placementOrUrl || 'https://uplcm.com',
+          rewardPoints: Math.max(0, cleanReward),
+          dailyLimit: 1,
+          estimatedDuration: cleanDuration,
+          startDate: '',
+          endDate: '',
+          status: syncStatus,
+          allowedCountries: 'ALL',
+          rewardVerificationMethod: 's2s_postback',
+          incentivizedTrafficAllowed: incentivized,
+          description: 'Daily Check-in Bonus Monetag Direct Link',
+          createdAt: createdAtVal,
+          updatedAt: serverTimestamp(),
+        }),
+      );
+    }
+
     await Promise.all(ops);
     return { usedCloudFunction: false };
   } catch (error) {
@@ -2365,69 +2895,210 @@ export async function initiateDailyBonusAdSession(user: UserProfile): Promise<{
     currentUser.getIdToken(),
     getAppCheckTokenHeader(),
   ]);
-  const endpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/startDailyBonusSession`;
 
-  const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), 10_000);
-  let response: Response;
+  let response: Response | null = null;
   try {
-    response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${idToken}`,
-        ...appCheckHeaders,
-      },
-      body: JSON.stringify({}),
-      signal: controller.signal,
-    });
+    response = await fetchBackendEndpointWithFallback(
+      'startDailyBonusSession',
+      idToken,
+      appCheckHeaders,
+      {},
+      10_000,
+    );
   } catch (err) {
     const isTimeout = err instanceof Error && err.name === 'AbortError';
-    throw new Error(
-      isTimeout
-        ? 'Verification server timed out. Please try again.'
-        : 'Unable to connect to the verification server. Deploy Cloud Functions (`startDailyBonusSession`) before claiming Daily Check-in Bonus.',
-    );
-  } finally {
-    window.clearTimeout(timeoutId);
+    if (isTimeout) {
+      throw new Error('Verification server timed out. Please try again.');
+    }
+    response = null;
   }
 
-  if (response.status === 404) {
-    throw new Error(
-      'Daily Check-in Bonus verification backend (`startDailyBonusSession`) is not deployed yet.',
-    );
+  if (response && response.status !== 404 && response.status !== 503) {
+    const body = (await response.json().catch(() => ({}))) as {
+      ok?: boolean;
+      sessionId?: string;
+      adId?: string;
+      dhakaDate?: string;
+      rewardPoints?: number;
+      durationSeconds?: number;
+      launchUrl?: string;
+      error?: string;
+    };
+
+    if (!response.ok || !body.ok || !body.sessionId || !body.launchUrl) {
+      const code = body.error || '';
+      throw new Error(
+        AD_SESSION_ERROR_MESSAGES[code] ||
+          code ||
+          'Could not start Daily Check-in Bonus advertisement session.',
+      );
+    }
+
+    const rewardPoints = Number(body.rewardPoints || 0);
+    const durationSeconds = normalizeAdDurationSeconds(body.durationSeconds);
+    const dhakaDate = body.dhakaDate || getDhakaDateKey();
+    const adId = body.adId || DAILY_CHECKIN_BONUS_AD_ID;
+
+    const session: AdSessionRecord = {
+      id: body.sessionId,
+      sessionId: body.sessionId,
+      userId: user.uid,
+      adId,
+      adName: 'Daily Check-in Bonus',
+      adNetwork: 'Monetag',
+      expectedRewardPoints: rewardPoints,
+      dhakaDate,
+      status: 'pending',
+      transactionId: '',
+      rejectionReason: '',
+      createdAtLabel: 'Just now',
+      createdAtMillis: Date.now(),
+    };
+
+    const ad: Advertisement = {
+      id: adId,
+      adId,
+      adName: 'Daily Check-in Bonus',
+      adNetwork: 'Monetag',
+      adType: 'direct_link',
+      placementOrUrl: body.launchUrl,
+      rewardPoints,
+      dailyLimit: 1,
+      estimatedDuration: durationSeconds,
+      startDate: '',
+      endDate: '',
+      status: 'active',
+      allowedCountries: 'ALL',
+      rewardVerificationMethod: 's2s_postback',
+      incentivizedTrafficAllowed: true,
+      description: 'Daily Check-in Bonus Monetag Advertisement',
+      createdAtMillis: Date.now(),
+      updatedAtMillis: Date.now(),
+    };
+
+    return { session, ad, launchUrl: body.launchUrl };
   }
 
-  const body = (await response.json().catch(() => ({}))) as {
-    ok?: boolean;
-    sessionId?: string;
-    adId?: string;
-    dhakaDate?: string;
-    rewardPoints?: number;
-    durationSeconds?: number;
-    launchUrl?: string;
-    error?: string;
-  };
+  // Firestore fallback when Cloud Functions & Vercel Service Account are not deployed yet
+  const dhakaDate = getDhakaDateKey();
+  const [bonusCfgSnap, walletSettingsSnap, economySnap, userBonusSnap, backingAdSnap] =
+    await Promise.all([
+      getDocFromServer(doc(db, 'appSettings', 'dailyBonus')),
+      getDocFromServer(doc(db, 'appSettings', 'wallet')).catch(() => null),
+      getDocFromServer(doc(db, 'appConfig', 'economy')).catch(() => null),
+      getDocFromServer(doc(db, 'dailyBonuses', user.uid)).catch(() => null),
+      getDocFromServer(doc(db, 'advertisements', DAILY_CHECKIN_BONUS_AD_ID)).catch(() => null),
+    ]);
 
-  if (!response.ok || !body.ok || !body.sessionId || !body.launchUrl) {
-    const code = body.error || '';
-    throw new Error(
-      AD_SESSION_ERROR_MESSAGES[code] ||
-        code ||
-        'Could not start Daily Check-in Bonus advertisement session.',
-    );
+  const ws = walletSettingsSnap?.exists() ? walletSettingsSnap.data() : {};
+  const ec = economySnap?.exists() ? economySnap.data() : {};
+  if (typeof ws.earningEnabled === 'boolean' && !ws.earningEnabled) {
+    throw new Error(AD_SESSION_ERROR_MESSAGES.EARNING_DISABLED);
+  }
+  if (!bonusCfgSnap.exists()) {
+    throw new Error(AD_SESSION_ERROR_MESSAGES.DAILY_BONUS_NOT_CONFIGURED);
+  }
+  const cfg = bonusCfgSnap.data();
+  if (cfg.enabled !== true) {
+    throw new Error(AD_SESSION_ERROR_MESSAGES.DAILY_BONUS_DISABLED);
+  }
+  if (cfg.incentivizedTrafficAllowed !== true) {
+    throw new Error(AD_SESSION_ERROR_MESSAGES.INCENTIVIZED_TRAFFIC_DISALLOWED);
   }
 
-  const rewardPoints = Number(body.rewardPoints || 0);
-  const durationSeconds = normalizeAdDurationSeconds(body.durationSeconds);
-  const dhakaDate = body.dhakaDate || getDhakaDateKey();
-  const adId = body.adId || DAILY_CHECKIN_BONUS_AD_ID;
+  const rawUrl = String(cfg.monetagDirectLinkUrl || '').trim();
+  if (!/^https:\/\/.+/i.test(rawUrl)) {
+    throw new Error(AD_SESSION_ERROR_MESSAGES.DAILY_BONUS_NOT_CONFIGURED);
+  }
+
+  const rewardPoints = Math.max(
+    0,
+    Math.floor(Number(cfg.rewardPoints || ws.dailyBonusPoints || ec.dailyBonusPoints || 0)),
+  );
+  if (rewardPoints < 1) {
+    throw new Error(AD_SESSION_ERROR_MESSAGES.DAILY_BONUS_NOT_CONFIGURED);
+  }
+  const durationSeconds = normalizeAdDurationSeconds(cfg.durationSeconds);
+
+  const lastClaimDate = userBonusSnap?.exists()
+    ? String(userBonusSnap.data().lastClaimDate || '')
+    : '';
+  if (lastClaimDate === dhakaDate) {
+    throw new Error(AD_SESSION_ERROR_MESSAGES.DAILY_BONUS_ALREADY_CLAIMED);
+  }
+
+  // Ensure backing doc exists (succeeds automatically if admin saved it or current user is Admin)
+  if (!backingAdSnap?.exists() || backingAdSnap.data()?.status !== 'active') {
+    try {
+      await setDoc(doc(db, 'advertisements', DAILY_CHECKIN_BONUS_AD_ID), {
+        adId: DAILY_CHECKIN_BONUS_AD_ID,
+        adName: 'Daily Check-in Bonus',
+        adNetwork: 'Monetag',
+        adType: 'direct_link',
+        placementOrUrl: rawUrl,
+        rewardPoints,
+        dailyLimit: 1,
+        estimatedDuration: durationSeconds,
+        startDate: '',
+        endDate: '',
+        status: 'active',
+        allowedCountries: 'ALL',
+        rewardVerificationMethod: 's2s_postback',
+        incentivizedTrafficAllowed: true,
+        description: 'Daily Check-in Bonus Monetag Direct Link',
+        createdAt: backingAdSnap?.exists()
+          ? backingAdSnap.data().createdAt || serverTimestamp()
+          : serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch {
+      // Non-admin user cannot create backing ad doc; saveDailyBonusAdConfig syncs it when Admin saves
+    }
+  }
+
+  const randomSuffix =
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID().replace(/-/g, '').slice(0, 12)
+      : Math.random().toString(36).slice(2, 14);
+  const sessionId = `sess_bonus_${Date.now()}_${randomSuffix}`;
+
+  try {
+    await setDoc(doc(db, 'adSessions', sessionId), {
+      sessionId,
+      userId: user.uid,
+      adId: DAILY_CHECKIN_BONUS_AD_ID,
+      adName: 'Daily Check-in Bonus',
+      adNetwork: 'Monetag',
+      expectedRewardPoints: rewardPoints,
+      dhakaDate,
+      status: 'pending',
+      transactionId: '',
+      rejectionReason: '',
+      createdAt: serverTimestamp(),
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : '';
+    if (msg.includes('permission-denied') || msg.includes('Missing or insufficient permissions')) {
+      throw new Error(
+        'Please ask Admin to re-save the Claim Bonus Monetag link once in Admin Panel (or deploy Cloud Functions) so Daily Bonus sessions can start.',
+      );
+    }
+    throw err;
+  }
+
+  const launchUrl =
+    buildPlacementLaunchUrl(rawUrl, {
+      sessionId,
+      userId: user.uid,
+      adId: DAILY_CHECKIN_BONUS_AD_ID,
+      adNetwork: 'Monetag',
+    }) || rawUrl;
 
   const session: AdSessionRecord = {
-    id: body.sessionId,
-    sessionId: body.sessionId,
+    id: sessionId,
+    sessionId,
     userId: user.uid,
-    adId,
+    adId: DAILY_CHECKIN_BONUS_AD_ID,
     adName: 'Daily Check-in Bonus',
     adNetwork: 'Monetag',
     expectedRewardPoints: rewardPoints,
@@ -2440,12 +3111,12 @@ export async function initiateDailyBonusAdSession(user: UserProfile): Promise<{
   };
 
   const ad: Advertisement = {
-    id: adId,
-    adId,
+    id: DAILY_CHECKIN_BONUS_AD_ID,
+    adId: DAILY_CHECKIN_BONUS_AD_ID,
     adName: 'Daily Check-in Bonus',
     adNetwork: 'Monetag',
     adType: 'direct_link',
-    placementOrUrl: body.launchUrl,
+    placementOrUrl: launchUrl,
     rewardPoints,
     dailyLimit: 1,
     estimatedDuration: durationSeconds,
@@ -2460,7 +3131,7 @@ export async function initiateDailyBonusAdSession(user: UserProfile): Promise<{
     updatedAtMillis: Date.now(),
   };
 
-  return { session, ad, launchUrl: body.launchUrl };
+  return { session, ad, launchUrl };
 }
 
 export function subscribeToUserNotifications(

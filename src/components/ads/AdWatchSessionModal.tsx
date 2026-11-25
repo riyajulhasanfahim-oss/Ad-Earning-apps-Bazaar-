@@ -392,6 +392,8 @@ export const AdWatchSessionModal: React.FC<AdWatchSessionModalProps> = ({
   const isMonetag = ad.adNetwork.toLowerCase().includes('monetag');
   const isDailyBonus = ad.adId === DAILY_CHECKIN_BONUS_AD_ID;
   const displayPoints = creditedPoints > 0 ? creditedPoints : session.expectedRewardPoints;
+  const displayPointsRef = useRef<number>(displayPoints);
+  displayPointsRef.current = displayPoints;
 
   // Show celebratory toast and smoothly auto-close popup once verified & credited
   useEffect(() => {
@@ -399,7 +401,7 @@ export const AdWatchSessionModal: React.FC<AdWatchSessionModalProps> = ({
     if (successToastedRef.current !== session.sessionId) {
       successToastedRef.current = session.sessionId;
       onSuccessToastRef.current?.(
-        `Congratulations! +${formatPoints(displayPoints)} Points Added Successfully.`,
+        `Congratulations! +${formatPoints(displayPointsRef.current)} Points Added Successfully.`,
       );
     }
 
@@ -417,7 +419,7 @@ export const AdWatchSessionModal: React.FC<AdWatchSessionModalProps> = ({
         window.clearTimeout(exitTimer);
       }
     };
-  }, [isCompleted, session.sessionId, displayPoints]);
+  }, [isCompleted, session.sessionId]);
 
   const handleRetryVerification = () => {
     setVerifyError('');
