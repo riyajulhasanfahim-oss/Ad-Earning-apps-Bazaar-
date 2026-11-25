@@ -712,15 +712,23 @@ export async function initiateAdSession(
         getAppCheckTokenHeader(),
       ]);
       const endpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/createAdSession`;
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${idToken}`,
-          ...appCheckHeaders,
-        },
-        body: JSON.stringify({ adId: ad.adId }),
-      });
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 10_000);
+      let response: Response;
+      try {
+        response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`,
+            ...appCheckHeaders,
+          },
+          body: JSON.stringify({ adId: ad.adId }),
+          signal: controller.signal,
+        });
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
 
       if (response.status !== 404) {
         const body = (await response.json().catch(() => ({}))) as {
@@ -2359,6 +2367,8 @@ export async function initiateDailyBonusAdSession(user: UserProfile): Promise<{
   ]);
   const endpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/startDailyBonusSession`;
 
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 10_000);
   let response: Response;
   try {
     response = await fetch(endpoint, {
@@ -2369,11 +2379,17 @@ export async function initiateDailyBonusAdSession(user: UserProfile): Promise<{
         ...appCheckHeaders,
       },
       body: JSON.stringify({}),
+      signal: controller.signal,
     });
-  } catch {
+  } catch (err) {
+    const isTimeout = err instanceof Error && err.name === 'AbortError';
     throw new Error(
-      'Unable to connect to the verification server. Deploy Cloud Functions (`startDailyBonusSession`) before claiming Daily Check-in Bonus.',
+      isTimeout
+        ? 'Verification server timed out. Please try again.'
+        : 'Unable to connect to the verification server. Deploy Cloud Functions (`startDailyBonusSession`) before claiming Daily Check-in Bonus.',
     );
+  } finally {
+    window.clearTimeout(timeoutId);
   }
 
   if (response.status === 404) {

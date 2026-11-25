@@ -394,9 +394,17 @@ export default function App() {
     let cancelled = false;
     setAdminVerifyStatus('checking');
 
+    // Watchdog: never leave users stuck on fullscreen "Loading view..." if network/Firestore is slow
+    const watchdogTimer = window.setTimeout(() => {
+      if (!cancelled) {
+        setAdminVerifyStatus((prev) => (prev === 'checking' ? 'done' : prev));
+      }
+    }, 2200);
+
     void verifyAdminAccessSession()
       .then((verified) => {
         if (cancelled) return;
+        window.clearTimeout(watchdogTimer);
         setAdminSession(verified);
         setAdminVerifyStatus('done');
 
@@ -425,6 +433,7 @@ export default function App() {
       })
       .catch(() => {
         if (cancelled) return;
+        window.clearTimeout(watchdogTimer);
         setAdminSession(null);
         setAdminVerifyStatus('done');
         setIsAdminRoute(false);
@@ -438,6 +447,7 @@ export default function App() {
 
     return () => {
       cancelled = true;
+      window.clearTimeout(watchdogTimer);
     };
   }, [authReady, firebaseUser, emailVerifiedFlag]);
 

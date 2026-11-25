@@ -38,6 +38,7 @@ import {
   recordAdminAuditLogClient,
 } from '../services/adminService';
 import { useToast } from '../components/ui/ToastProvider';
+import { ClaimBonusLinkCard } from './ClaimBonusLinkCard';
 
 interface AdminAdsSectionProps {
   ads: Advertisement[];
@@ -268,6 +269,9 @@ export const AdminAdsSection: React.FC<AdminAdsSectionProps> = ({
           </span>
         </div>
       )}
+
+      {/* Claim Bonus Monetag Link & Reward Configuration */}
+      <ClaimBonusLinkCard adminRole={adminRole} />
 
       {/* Header & Filters */}
       <div className="rounded-2xl bg-[#0D1330] border border-white/10 p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-3">

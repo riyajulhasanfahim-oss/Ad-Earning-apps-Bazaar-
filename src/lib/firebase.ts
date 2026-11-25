@@ -63,10 +63,37 @@ export const appCheckState: AppCheckState = {
   debugMode: isDevEnvironment && Boolean(debugTokenEnv),
 };
 
+function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise<T>((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        resolve(fallback);
+      }
+    }, ms);
+    promise
+      .then((val) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(val);
+        }
+      })
+      .catch(() => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(fallback);
+        }
+      });
+  });
+}
+
 export async function getAppCheckTokenHeader(): Promise<Record<string, string>> {
   if (!appCheckInstance) return {};
   try {
-    const result = await getToken(appCheckInstance, false);
+    const result = await withTimeout(getToken(appCheckInstance, false), 2500, null);
     if (result?.token) {
       return { 'X-Firebase-AppCheck': result.token };
     }

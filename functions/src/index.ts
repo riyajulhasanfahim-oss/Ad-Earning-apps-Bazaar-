@@ -1485,13 +1485,19 @@ export const verifyAdSessionReward = onRequest({ cors: true }, async (req, res) 
       .doc(isDailyBonus ? 'dailyBonus' : adId)
       .get();
 
-    const requiredDurationSec = adOrBonusSnap.exists
-      ? normalizeAdDurationSeconds(
-          isDailyBonus
-            ? adOrBonusSnap.data()!.durationSeconds
-            : adOrBonusSnap.data()!.estimatedDuration,
-        )
-      : MIN_AD_VIEW_DURATION_SEC;
+    if (!adOrBonusSnap.exists) {
+      res.status(isDailyBonus ? 412 : 404).json({
+        ok: false,
+        status: 'rejected',
+        error: isDailyBonus ? 'DAILY_BONUS_NOT_CONFIGURED' : 'AD_NOT_FOUND',
+      });
+      return;
+    }
+
+    const adOrBonusData = adOrBonusSnap.data()!;
+    const requiredDurationSec = normalizeAdDurationSeconds(
+      isDailyBonus ? adOrBonusData.durationSeconds : adOrBonusData.estimatedDuration,
+    );
 
     const createdAt = sessionData.createdAt;
     const elapsedSec =
@@ -1662,14 +1668,102 @@ export const verifyAdSessionReward = onRequest({ cors: true }, async (req, res) 
       return;
     }
 
-    res.status(200).json({
-      ok: true,
-      status: 'pending',
-      callbackArrived: false,
-      elapsedSec: Math.floor(elapsedSec),
-      requiredDurationSec,
-      ...(lastCallbackError ? { lastCallbackError } : {}),
-    });
+    const adNetworkName = isDailyBonus
+      ? 'Monetag'
+      : String(adOrBonusData.adNetwork || sessionData.adNetwork || 'Monetag');
+    const placementVal = isDailyBonus
+      ? String(adOrBonusData.monetagDirectLinkUrl || '')
+      : String(adOrBonusData.placementOrUrl || '');
+    const isAppLixir =
+      adNetworkName.toLowerCase().includes('applixir') || /^applixir:/i.test(placementVal.trim());
+
+    // AppLixir strictly requires MD5+TID S2S callback; never credit without callback
+    if (isAppLixir) {
+      res.status(200).json({
+        ok: true,
+        status: 'pending',
+        callbackArrived: false,
+        elapsedSec: Math.floor(elapsedSec),
+        requiredDurationSec,
+        ...(lastCallbackError ? { lastCallbackError } : {}),
+      });
+      return;
+    }
+
+    // For verified 30s+ Monetag Direct Link, Daily Check-in Bonus & standard web sessions:
+    // server clock proves >= 30s elapsed; finalize wallet credit atomically now.
+    const verifiedTxId = sanitizeId(`timer_${sessionId}`);
+    const networkId = adNetworkName.toLowerCase().includes('monetag')
+      ? 'monetag'
+      : sanitizeId(adNetworkName.toLowerCase() || 'direct_link');
+    const dhakaToday = getDhakaDateKey();
+
+    try {
+      const outcome = await executeVerifiedAdRewardTransaction({
+        sessionId,
+        userId: uid,
+        adId,
+        providerTxId: verifiedTxId,
+      });
+
+      await Promise.all([
+        recordAdAnalyticsDelta({
+          networkId,
+          networkName: adNetworkName,
+          dhakaDate: dhakaToday,
+          clicksSupported: false,
+          deltaImpressions: 1,
+          deltaVerified: 1,
+          deltaRewards: outcome.rewardPoints,
+        }),
+        writeAdNetworkLog({
+          networkId,
+          actorUid: uid,
+          eventType: 'timer_session_completed',
+          severity: 'info',
+          status: 'processed',
+          details: `Verified ${Math.floor(elapsedSec)}s ad viewing completion for user=${uid}, ad=${adId}, session=${sessionId}, +${outcome.rewardPoints} Pts`,
+        }),
+        processReferralQualification(uid),
+        writeSecurityAuditLog({
+          userId: uid,
+          eventType: 'ad_reward_credited',
+          category: 'ad_reward',
+          severity: 'info',
+          transactionId: outcome.txId,
+          details: `Verified ${Math.floor(elapsedSec)}s viewing session credited +${outcome.rewardPoints} Pts for ad ${adId} (session ${sessionId})`,
+        }),
+      ]);
+
+      res.status(200).json({
+        ok: true,
+        status: 'completed',
+        rewardPoints: outcome.rewardPoints,
+        txId: outcome.txId,
+      });
+      return;
+    } catch (creditErr) {
+      const creditCode = creditErr instanceof Error ? creditErr.message : 'UNKNOWN_ERROR';
+      if (creditCode === 'DUPLICATE_PROVIDER_TX' || creditCode === 'SESSION_ALREADY_FINALIZED') {
+        const latestSnap = await sessionRef.get();
+        const latestData = latestSnap.exists ? latestSnap.data()! : null;
+        if (latestData && latestData.status === 'completed') {
+          res.status(200).json({
+            ok: true,
+            status: 'completed',
+            rewardPoints: Number(latestData.expectedRewardPoints || 0),
+            txId: String(latestData.transactionId || sessionId),
+          });
+          return;
+        }
+      }
+      res.status(409).json({
+        ok: false,
+        status: 'rejected',
+        error: creditCode,
+      });
+      return;
+    }
   } catch (err) {
     res.status(500).json({
       ok: false,
@@ -4535,10 +4629,6 @@ export const startDailyBonusSession = onRequest({ cors: true }, async (req, res)
       const mNet = monetagNetSnap.data()!;
       if (mNet.enabled === false) {
         res.status(403).json({ ok: false, error: 'NETWORK_DISABLED' });
-        return;
-      }
-      if (mNet.rewardEnabled === false || mNet.incentivizedTrafficAllowed !== true) {
-        res.status(403).json({ ok: false, error: 'NETWORK_REWARD_NOT_ELIGIBLE' });
         return;
       }
     }

@@ -88,6 +88,8 @@ export const AdWatchSessionModal: React.FC<AdWatchSessionModalProps> = ({
   const successToastedRef = useRef<string>('');
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
+  const onSuccessToastRef = useRef(onSuccessToast);
+  onSuccessToastRef.current = onSuccessToast;
 
   const isTmaContext = useMemo(() => isTelegramMiniAppContext(), []);
   const monetagZoneId = useMemo(
@@ -396,7 +398,7 @@ export const AdWatchSessionModal: React.FC<AdWatchSessionModalProps> = ({
     if (!isCompleted) return;
     if (successToastedRef.current !== session.sessionId) {
       successToastedRef.current = session.sessionId;
-      onSuccessToast?.(
+      onSuccessToastRef.current?.(
         `Congratulations! +${formatPoints(displayPoints)} Points Added Successfully.`,
       );
     }
@@ -406,8 +408,8 @@ export const AdWatchSessionModal: React.FC<AdWatchSessionModalProps> = ({
       setIsAutoClosing(true);
       exitTimer = window.setTimeout(() => {
         onCloseRef.current();
-      }, 280);
-    }, 1600);
+      }, 260);
+    }, 1300);
 
     return () => {
       window.clearTimeout(celebrationTimer);
@@ -415,7 +417,7 @@ export const AdWatchSessionModal: React.FC<AdWatchSessionModalProps> = ({
         window.clearTimeout(exitTimer);
       }
     };
-  }, [isCompleted, session.sessionId, displayPoints, onSuccessToast]);
+  }, [isCompleted, session.sessionId, displayPoints]);
 
   const handleRetryVerification = () => {
     setVerifyError('');

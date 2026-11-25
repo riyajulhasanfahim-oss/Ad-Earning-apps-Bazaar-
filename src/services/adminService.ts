@@ -112,6 +112,23 @@ export interface VerifiedAdminSession {
   reason?: string;
 }
 
+function withAdminVerifyTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error('ADMIN_VERIFY_TIMEOUT'));
+    }, ms);
+    promise
+      .then((value) => {
+        clearTimeout(timer);
+        resolve(value);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
 export async function verifyAdminAccessSession(): Promise<VerifiedAdminSession> {
   const user = auth.currentUser;
   if (!user) {
@@ -126,96 +143,124 @@ export async function verifyAdminAccessSession(): Promise<VerifiedAdminSession> 
     };
   }
 
-  try {
-    await user.reload();
-  } catch {
-    // Non-fatal if offline
-  }
+  const runVerification = async (): Promise<VerifiedAdminSession> => {
+    try {
+      await withAdminVerifyTimeout(user.reload(), 2200);
+    } catch {
+      // Non-fatal if offline or slow
+    }
 
-  const emailVerified = Boolean(user.emailVerified);
-  if (!emailVerified) {
+    const emailVerified = Boolean(user.emailVerified);
+    if (!emailVerified) {
+      return {
+        authorized: false,
+        role: null,
+        claimRole: null,
+        claimsVerified: false,
+        emailVerified: false,
+        verificationSource: 'unauthorized',
+        reason: 'Email verification is mandatory for Admin Panel access.',
+      };
+    }
+
+    let claimRole: AdminRole | null = null;
+    try {
+      const tokenResult = await withAdminVerifyTimeout(user.getIdTokenResult(false), 2200);
+      const raw = tokenResult.claims?.adminRole;
+      if (raw === 'super_admin' || raw === 'admin' || raw === 'support_admin') {
+        claimRole = raw;
+      }
+    } catch {
+      claimRole = null;
+    }
+
+    // Server-enforced Firestore Rules verification (never rely on client-side email string alone)
+    try {
+      await withAdminVerifyTimeout(
+        getDocsFromServer(query(collection(db, 'admins'), limit(1))),
+        2500,
+      );
+      return {
+        authorized: true,
+        role: claimRole ?? 'super_admin',
+        claimRole,
+        claimsVerified: Boolean(claimRole),
+        emailVerified: true,
+        verificationSource: claimRole ? 'custom_claims' : 'bootstrap_super_admin',
+      };
+    } catch {
+      // Not a super_admin according to Firestore backend rules or timed out; check admin/support tier
+    }
+
+    try {
+      const adminSnap = await withAdminVerifyTimeout(
+        getDocFromServer(doc(db, 'admins', user.uid)),
+        2500,
+      );
+      if (adminSnap.exists()) {
+        await withAdminVerifyTimeout(
+          getDocsFromServer(query(collection(db, 'adminLogs'), limit(1))),
+          2500,
+        );
+        const r = String(adminSnap.data()?.role || 'admin');
+        const docRole: AdminRole =
+          r === 'super_admin' || r === 'admin' || r === 'support_admin' ? r : 'admin';
+        return {
+          authorized: true,
+          role: claimRole ?? docRole,
+          claimRole,
+          claimsVerified: Boolean(claimRole),
+          emailVerified: true,
+          verificationSource: claimRole ? 'custom_claims' : 'admins_doc',
+        };
+      }
+    } catch {
+      // Denied by Firestore rules -> regular user
+    }
+
+    if (claimRole) {
+      try {
+        await withAdminVerifyTimeout(
+          getDocsFromServer(query(collection(db, 'adminLogs'), limit(1))),
+          2500,
+        );
+        return {
+          authorized: true,
+          role: claimRole,
+          claimRole,
+          claimsVerified: true,
+          emailVerified: true,
+          verificationSource: 'custom_claims',
+        };
+      } catch {
+        // Custom claim not accepted by Firestore backend rules
+      }
+    }
+
     return {
       authorized: false,
       role: null,
       claimRole: null,
       claimsVerified: false,
-      emailVerified: false,
+      emailVerified,
       verificationSource: 'unauthorized',
-      reason: 'Email verification is mandatory for Admin Panel access.',
+      reason: 'Unauthorized: This account does not hold verified Admin privileges.',
     };
-  }
-
-  let claimRole: AdminRole | null = null;
-  try {
-    const tokenResult = await user.getIdTokenResult(true);
-    const raw = tokenResult.claims?.adminRole;
-    if (raw === 'super_admin' || raw === 'admin' || raw === 'support_admin') {
-      claimRole = raw;
-    }
-  } catch {
-    claimRole = null;
-  }
-
-  // Server-enforced Firestore Rules verification (never rely on client-side email string alone)
-  try {
-    await getDocsFromServer(query(collection(db, 'admins'), limit(1)));
-    return {
-      authorized: true,
-      role: claimRole ?? 'super_admin',
-      claimRole,
-      claimsVerified: Boolean(claimRole),
-      emailVerified: true,
-      verificationSource: claimRole ? 'custom_claims' : 'bootstrap_super_admin',
-    };
-  } catch {
-    // Not a super_admin according to Firestore backend rules; check admin/support tier
-  }
-
-  try {
-    const adminSnap = await getDocFromServer(doc(db, 'admins', user.uid));
-    if (adminSnap.exists()) {
-      await getDocsFromServer(query(collection(db, 'adminLogs'), limit(1)));
-      const r = String(adminSnap.data()?.role || 'admin');
-      const docRole: AdminRole =
-        r === 'super_admin' || r === 'admin' || r === 'support_admin' ? r : 'admin';
-      return {
-        authorized: true,
-        role: claimRole ?? docRole,
-        claimRole,
-        claimsVerified: Boolean(claimRole),
-        emailVerified: true,
-        verificationSource: claimRole ? 'custom_claims' : 'admins_doc',
-      };
-    }
-  } catch {
-    // Denied by Firestore rules -> regular user
-  }
-
-  if (claimRole) {
-    try {
-      await getDocsFromServer(query(collection(db, 'adminLogs'), limit(1)));
-      return {
-        authorized: true,
-        role: claimRole,
-        claimRole,
-        claimsVerified: true,
-        emailVerified: true,
-        verificationSource: 'custom_claims',
-      };
-    } catch {
-      // Custom claim not accepted by Firestore backend rules
-    }
-  }
-
-  return {
-    authorized: false,
-    role: null,
-    claimRole: null,
-    claimsVerified: false,
-    emailVerified,
-    verificationSource: 'unauthorized',
-    reason: 'Unauthorized: This account does not hold verified Admin privileges.',
   };
+
+  try {
+    return await withAdminVerifyTimeout(runVerification(), 4500);
+  } catch {
+    return {
+      authorized: false,
+      role: null,
+      claimRole: null,
+      claimsVerified: false,
+      emailVerified: Boolean(user.emailVerified),
+      verificationSource: 'unauthorized',
+      reason: 'Verification check timed out.',
+    };
+  }
 }
 
 export function getDefaultSiteSettings(): SiteSettingsConfig {

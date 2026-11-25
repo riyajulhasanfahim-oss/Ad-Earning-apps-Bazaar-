@@ -211,10 +211,14 @@ export const AdminApp: React.FC<AdminAppProps> = ({ onExitToUserSite }) => {
 
   const refreshVerification = useCallback(async () => {
     setVerifying(true);
+    const safetyTimer = window.setTimeout(() => {
+      setVerifying(false);
+    }, 5000);
     try {
       const verified = await verifyAdminAccessSession();
       setSession(verified);
     } finally {
+      window.clearTimeout(safetyTimer);
       setVerifying(false);
     }
   }, []);

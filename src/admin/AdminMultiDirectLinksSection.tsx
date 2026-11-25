@@ -39,6 +39,7 @@ import {
   toggleDirectLinkAdStatus,
 } from '../services/multiDirectLinkService';
 import { useToast } from '../components/ui/ToastProvider';
+import { ClaimBonusLinkCard } from './ClaimBonusLinkCard';
 
 interface AdminMultiDirectLinksSectionProps {
   directLinkAds: DirectLinkAdRecord[];
@@ -392,6 +393,9 @@ export const AdminMultiDirectLinksSection: React.FC<AdminMultiDirectLinksSection
           </div>
         </div>
       </div>
+
+      {/* Daily Claim Bonus — Dedicated Monetag Link & Reward Configuration */}
+      <ClaimBonusLinkCard adminRole={adminRole} />
 
       {/* KPI Cards */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
