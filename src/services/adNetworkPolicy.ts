@@ -172,24 +172,28 @@ export function buildPlacementLaunchUrl(
   try {
     const resolved = trimmed
       .replace(/\{sessionId\}|\{session_id\}|\{ymid\}/gi, encodeURIComponent(params.sessionId))
-      .replace(/\{userId\}|\{user_id\}|\{subid\}/gi, encodeURIComponent(params.userId))
+      .replace(/\{userId\}|\{user_id\}|\{var\}|\{request_var\}/gi, encodeURIComponent(params.userId))
       .replace(/\{adId\}|\{ad_id\}/gi, encodeURIComponent(params.adId));
 
     const url = new URL(resolved);
     if (url.protocol !== 'https:' && url.protocol !== 'http:') {
       return null;
     }
-    if (!url.searchParams.has('session_id') && !trimmed.toLowerCase().includes('session')) {
-      url.searchParams.set('session_id', params.sessionId);
-    }
-    if (!url.searchParams.has('subid') && !trimmed.toLowerCase().includes('user')) {
-      url.searchParams.set('subid', params.userId);
-    }
-    if (
-      params.adNetwork?.toLowerCase().includes('monetag') &&
-      !url.searchParams.has('ymid')
-    ) {
-      url.searchParams.set('ymid', params.sessionId);
+    const isMonetag = params.adNetwork?.toLowerCase().includes('monetag');
+    if (isMonetag) {
+      if (!url.searchParams.has('ymid')) {
+        url.searchParams.set('ymid', params.sessionId);
+      }
+      if (!url.searchParams.has('var') && !trimmed.toLowerCase().includes('user')) {
+        url.searchParams.set('var', params.userId);
+      }
+    } else {
+      if (!url.searchParams.has('session_id') && !trimmed.toLowerCase().includes('session')) {
+        url.searchParams.set('session_id', params.sessionId);
+      }
+      if (!url.searchParams.has('var') && !trimmed.toLowerCase().includes('user')) {
+        url.searchParams.set('var', params.userId);
+      }
     }
     return url.toString();
   } catch {

@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
@@ -41,11 +41,41 @@ import {
   saveAdNetworkConfiguration,
   testAdNetworkHealth,
 } from '../services/adNetworkService';
+import { activeFirebaseConfig } from '../lib/firebase';
+import { clearSameOriginHealthCache } from '../services/dashboardService';
 import { formatPoints } from '../services/appService';
 import { AdNetworkDirectLinksTab } from './AdNetworkDirectLinksTab';
 import { AdNetworkCampaignsTab } from './AdNetworkCampaignsTab';
 import { AdNetworkCallbacksLogsTab } from './AdNetworkCallbacksLogsTab';
 import { useToast } from '../components/ui/ToastProvider';
+
+interface BackendHealthCheckItem {
+  status: 'SUCCESS' | 'FAILED';
+  label: string;
+  detail: string;
+}
+
+interface BackendHealthReport {
+  allHealthy: boolean;
+  environment: string;
+  environmentLabel: string;
+  targetProjectId: string;
+  targetDatabaseId: string;
+  projectIdMatched: boolean;
+  databaseIdConfigured: boolean;
+  serviceAccountProjectId: string | null;
+  clientEmailMasked: string | null;
+  credentialStatus: string;
+  configurationError: string | null;
+  checks: {
+    firebaseAdminInitialized: BackendHealthCheckItem;
+    firestoreConnected: BackendHealthCheckItem;
+    firestoreWritePermission: BackendHealthCheckItem;
+    monetagPostbackConfigured: BackendHealthCheckItem;
+    rewardVerificationApiWorking: BackendHealthCheckItem;
+  };
+  timestamp: string;
+}
 
 interface AdminAdNetworksSectionProps {
   networks: AdNetworkConfig[];
@@ -136,6 +166,50 @@ export const AdminAdNetworksSection: React.FC<AdminAdNetworksSectionProps> = ({
   const [testingId, setTestingId] = useState<string | null>(null);
   const [appLixirEnvStatus, setAppLixirEnvStatus] =
     useState<AppLixirEnvCredentialsStatus | null>(null);
+  const [backendHealth, setBackendHealth] = useState<BackendHealthReport | null>(null);
+  const [healthLoading, setHealthLoading] = useState<boolean>(false);
+  const [healthFetchError, setHealthFetchError] = useState<string>('');
+
+  const runLiveBackendHealthCheck = useCallback(async (manual = false) => {
+    setHealthLoading(true);
+    setHealthFetchError('');
+    if (manual) {
+      clearSameOriginHealthCache();
+    }
+    try {
+      const resp = await fetch('/api/health', {
+        method: 'GET',
+        headers: {
+          'X-Firebase-Project-Id': activeFirebaseConfig.projectId,
+          'X-Firestore-Database-Id': activeFirebaseConfig.firestoreDatabaseId || '(default)',
+        },
+      });
+      const contentType = resp.headers.get('content-type') || '';
+      if (!resp.ok || !contentType.includes('application/json')) {
+        throw new Error(`Health endpoint returned HTTP ${resp.status}`);
+      }
+      const data = (await resp.json()) as BackendHealthReport;
+      setBackendHealth(data);
+      if (manual) {
+        showToast(
+          data.allHealthy
+            ? 'All 5 backend Reward Verification & Firestore checks passed.'
+            : 'Backend Health Check detected configuration issues (see details below).',
+          data.allHealthy ? 'success' : 'error',
+        );
+      }
+    } catch (err) {
+      setHealthFetchError(
+        err instanceof Error ? err.message : 'Unable to reach /api/health endpoint.',
+      );
+    } finally {
+      setHealthLoading(false);
+    }
+  }, [showToast]);
+
+  useEffect(() => {
+    void runLiveBackendHealthCheck(false);
+  }, [runLiveBackendHealthCheck]);
 
   // Merge Firestore networks with built-in Monetag & Adsterra blueprints if not yet initialized
   const displayNetworks = useMemo(() => {
@@ -232,7 +306,7 @@ export const AdminAdNetworksSection: React.FC<AdminAdNetworksSectionProps> = ({
         directLinkUrl: '',
         apiBaseUrl: '',
         callbackUrl: getCanonicalCallbackUrl(newId),
-        postbackParamsTemplate: 'ymid={session_id}&subid={user_id}&tx_id={provider_tx_id}&ts={ts}&sig={hmac}',
+        postbackParamsTemplate: 'ymid={ymid}&user_id={user_id}&tx_id={provider_tx_id}&ts={ts}&sig={hmac}',
         incentivizedTrafficAllowed: false,
         rewardVerificationSupported: true,
         rewardEnabled: false,
@@ -491,6 +565,118 @@ export const AdminAdNetworksSection: React.FC<AdminAdNetworksSectionProps> = ({
       {/* Tab 1: Networks & Health Cards */}
       {activeTab === 'networks' && (
         <div className="space-y-4">
+          {/* Live 5-Point Reward Verification & Firestore Health Check */}
+          <div className="rounded-2xl bg-[#0D1330] border border-white/10 p-4 sm:p-5 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <h3 className="text-sm font-extrabold font-display text-white">
+                    Backend Reward Verification Health Check
+                  </h3>
+                  {backendHealth && (
+                    <span
+                      className={`text-[10px] font-bold px-2 py-0.5 rounded border ${
+                        backendHealth.allHealthy
+                          ? 'bg-emerald-500/15 text-emerald-300 border-emerald-400/35'
+                          : 'bg-rose-500/15 text-rose-300 border-rose-400/35'
+                      }`}
+                    >
+                      {backendHealth.allHealthy ? 'ALL CHECKS PASSED' : 'ACTION REQUIRED'}
+                    </span>
+                  )}
+                  {backendHealth && (
+                    <span className="text-[10px] font-mono-num px-2 py-0.5 rounded bg-white/5 border border-white/10 text-slate-300">
+                      {backendHealth.environmentLabel}
+                    </span>
+                  )}
+                </div>
+                {backendHealth && (
+                  <p className="text-[11px] text-slate-400 font-mono-num mt-1">
+                    Project: {backendHealth.targetProjectId || 'Unset'} · DB:{' '}
+                    {backendHealth.targetDatabaseId || '(default)'}
+                    {backendHealth.serviceAccountProjectId
+                      ? ` · SA Project: ${backendHealth.serviceAccountProjectId}`
+                      : ''}
+                  </p>
+                )}
+              </div>
+
+              <button
+                type="button"
+                disabled={healthLoading}
+                onClick={() => void runLiveBackendHealthCheck(true)}
+                className="min-h-[36px] px-3.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/15 text-xs font-bold text-white inline-flex items-center gap-1.5 disabled:opacity-50"
+              >
+                {healthLoading ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="w-3.5 h-3.5" />
+                )}
+                <span>Run Live Check</span>
+              </button>
+            </div>
+
+            {healthFetchError && (
+              <div className="rounded-xl bg-rose-500/10 border border-rose-400/30 p-3 text-xs text-rose-200">
+                {healthFetchError}
+              </div>
+            )}
+
+            {backendHealth?.checks && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5">
+                {[
+                  backendHealth.checks.firebaseAdminInitialized,
+                  backendHealth.checks.firestoreConnected,
+                  backendHealth.checks.firestoreWritePermission,
+                  backendHealth.checks.monetagPostbackConfigured,
+                  backendHealth.checks.rewardVerificationApiWorking,
+                ].map((item) => {
+                  const ok = item.status === 'SUCCESS';
+                  return (
+                    <div
+                      key={item.label}
+                      className={`rounded-xl border p-3 space-y-1.5 ${
+                        ok
+                          ? 'bg-emerald-500/10 border-emerald-400/25'
+                          : 'bg-rose-500/10 border-rose-400/25'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[11px] font-bold text-white leading-tight">
+                          {item.label}
+                        </span>
+                        <span
+                          className={`text-[10px] font-extrabold font-mono-num px-1.5 py-0.5 rounded shrink-0 ${
+                            ok
+                              ? 'bg-emerald-500/20 text-emerald-300'
+                              : 'bg-rose-500/20 text-rose-300'
+                          }`}
+                        >
+                          {item.status}
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-slate-300 leading-snug break-words">
+                        {item.detail}
+                      </p>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {backendHealth?.configurationError && (
+              <div className="rounded-xl bg-amber-500/10 border border-amber-400/30 p-3 flex items-start gap-2.5 text-xs text-amber-100">
+                <AlertTriangle className="w-4 h-4 text-amber-300 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <p className="font-bold text-amber-200">Configuration Diagnostic</p>
+                  <p className="text-amber-100/90 leading-relaxed">
+                    {backendHealth.configurationError}
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
+
           <div className="rounded-2xl bg-violet-500/10 border border-violet-400/25 p-3.5 flex items-start gap-2.5 text-xs text-violet-100">
             <ShieldCheck className="w-4 h-4 text-violet-300 shrink-0 mt-0.5" />
             <span>

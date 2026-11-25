@@ -347,6 +347,127 @@ service cloud.firestore {
         data.createdAt is timestamp;
     }
 
+    function isValidWallet(data) {
+      return data.keys().hasAll([
+          'userId', 'totalPoints', 'availablePoints', 'pendingPoints', 'reservedPoints',
+          'totalEarnedPoints', 'totalWithdrawnPoints', 'totalWithdrawnBdt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'userId', 'totalPoints', 'availablePoints', 'pendingPoints', 'reservedPoints',
+          'totalEarnedPoints', 'totalWithdrawnPoints', 'totalWithdrawnBdt', 'lastTransactionId', 'updatedAt'
+        ]) &&
+        isValidId(data.userId) &&
+        data.totalPoints is number && data.totalPoints >= 0 &&
+        data.availablePoints is number && data.availablePoints >= 0 &&
+        data.pendingPoints is number && data.pendingPoints >= 0 &&
+        data.reservedPoints is number && data.reservedPoints >= 0 &&
+        data.totalEarnedPoints is number && data.totalEarnedPoints >= 0 &&
+        data.totalWithdrawnPoints is number && data.totalWithdrawnPoints >= 0 &&
+        data.totalWithdrawnBdt is number && data.totalWithdrawnBdt >= 0 &&
+        (!('lastTransactionId' in data) || (data.lastTransactionId is string && data.lastTransactionId.size() <= 128)) &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidWalletLedgerEntry(data) {
+      return data.keys().hasAll([
+          'entryId', 'transactionId', 'userId', 'entryType', 'transactionType',
+          'pointsDelta', 'bdtAmount', 'conversionRateUsed', 'previousPoints', 'newPoints',
+          'previousReservedPoints', 'newReservedPoints', 'status', 'description', 'createdAt'
+        ]) &&
+        data.keys().hasOnly([
+          'entryId', 'transactionId', 'userId', 'entryType', 'transactionType',
+          'pointsDelta', 'bdtAmount', 'conversionRateUsed', 'previousPoints', 'newPoints',
+          'previousReservedPoints', 'newReservedPoints', 'status', 'description', 'createdAt'
+        ]) &&
+        isValidId(data.entryId) &&
+        isValidId(data.transactionId) &&
+        isValidId(data.userId) &&
+        data.entryType in ['credit', 'debit', 'reserve', 'release'] &&
+        data.transactionType in ['ad_reward', 'daily_bonus', 'referral_bonus', 'withdrawal', 'admin_credit', 'admin_debit', 'refund'] &&
+        data.pointsDelta is number &&
+        data.bdtAmount is number && data.bdtAmount >= 0 &&
+        data.conversionRateUsed is number && data.conversionRateUsed >= 0 &&
+        data.previousPoints is number && data.previousPoints >= 0 &&
+        data.newPoints is number && data.newPoints >= 0 &&
+        data.previousReservedPoints is number && data.previousReservedPoints >= 0 &&
+        data.newReservedPoints is number && data.newReservedPoints >= 0 &&
+        data.status in ['completed', 'pending', 'rejected', 'reversed'] &&
+        data.description is string && data.description.size() <= 300 &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidAdCompletion(data) {
+      return data.keys().hasAll([
+          'completionId', 'providerTxId', 'sessionId', 'userId', 'adId',
+          'adName', 'adNetwork', 'rewardPoints', 'transactionId',
+          'dhakaDate', 'status', 'createdAt'
+        ]) &&
+        data.keys().hasOnly([
+          'completionId', 'providerTxId', 'sessionId', 'userId', 'adId',
+          'adName', 'adNetwork', 'rewardPoints', 'transactionId',
+          'dhakaDate', 'status', 'createdAt'
+        ]) &&
+        isValidId(data.completionId) &&
+        isValidId(data.providerTxId) &&
+        isValidId(data.sessionId) &&
+        isValidId(data.userId) &&
+        isValidId(data.adId) &&
+        isValidId(data.transactionId) &&
+        data.adName is string && data.adName.size() >= 2 && data.adName.size() <= 100 &&
+        data.adNetwork is string && data.adNetwork.size() >= 2 && data.adNetwork.size() <= 60 &&
+        data.rewardPoints is number && data.rewardPoints >= 0 && data.rewardPoints <= 10000 &&
+        data.dhakaDate is string && data.dhakaDate.size() == 10 && data.dhakaDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') &&
+        data.status in ['completed', 'rejected'] &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidDailyAdLimit(data) {
+      return data.keys().hasAll(['userId', 'dhakaDate', 'completedCount', 'earnedPoints', 'updatedAt']) &&
+        data.keys().hasOnly(['userId', 'dhakaDate', 'completedCount', 'earnedPoints', 'completedAdIds', 'updatedAt']) &&
+        isValidId(data.userId) &&
+        data.dhakaDate is string && data.dhakaDate.size() == 10 && data.dhakaDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') &&
+        data.completedCount is number && data.completedCount >= 0 && data.completedCount <= 500 &&
+        data.earnedPoints is number && data.earnedPoints >= 0 &&
+        (!('completedAdIds' in data) || (data.completedAdIds is list && data.completedAdIds.size() <= 500 && (data.completedAdIds.size() == 0 || data.completedAdIds[0] is string))) &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidTransaction(data) {
+      return data.keys().hasAll(['userId', 'title', 'type', 'pointsDelta', 'status', 'createdAt']) &&
+        data.keys().hasOnly([
+          'transactionId', 'userId', 'title', 'subtitle', 'description',
+          'type', 'direction', 'pointsDelta', 'points', 'bdtAmount',
+          'conversionRateUsed', 'status', 'createdAt'
+        ]) &&
+        (!('transactionId' in data) || (data.transactionId is string && data.transactionId.size() <= 128)) &&
+        isValidId(data.userId) &&
+        data.title is string && data.title.size() >= 2 && data.title.size() <= 100 &&
+        (!('subtitle' in data) || (data.subtitle is string && data.subtitle.size() <= 160)) &&
+        (!('description' in data) || (data.description is string && data.description.size() <= 300)) &&
+        data.type in ['ad_reward', 'daily_bonus', 'referral_bonus', 'withdrawal', 'admin_credit', 'admin_debit', 'refund', 'admin_adjustment'] &&
+        (!('direction' in data) || data.direction in ['credit', 'debit']) &&
+        data.pointsDelta is number &&
+        (!('points' in data) || data.points is number) &&
+        (!('bdtAmount' in data) || data.bdtAmount == null || data.bdtAmount is number) &&
+        (!('conversionRateUsed' in data) || data.conversionRateUsed == null || data.conversionRateUsed is number) &&
+        data.status in ['completed', 'pending', 'rejected', 'reversed'] &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidDailyBonusState(data) {
+      return data.keys().hasAll(['uid', 'streakDays', 'lastClaimDate', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'streakDays', 'lastClaimDate', 'lastClaimPoints', 'updatedAt']) &&
+        isValidId(data.uid) &&
+        data.streakDays is number && data.streakDays >= 1 &&
+        data.lastClaimDate is string && data.lastClaimDate.size() >= 8 && data.lastClaimDate.size() <= 20 && data.lastClaimDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') &&
+        (!('lastClaimPoints' in data) || (data.lastClaimPoints is number && data.lastClaimPoints >= 1)) &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidTimerTxId(txId) {
+      return txId is string && txId.size() >= 13 && txId.size() <= 105 && txId.matches('^tx_timer_[a-zA-Z0-9_\\-]+$');
+    }
+
     function isValidNotification(data) {
       return data.keys().hasAll(['userId', 'title', 'message', 'read', 'createdAt']) &&
         data.keys().hasOnly(['userId', 'title', 'message', 'read', 'createdAt']) &&
@@ -760,24 +881,111 @@ service cloud.firestore {
               incoming().diff(existing()).affectedKeys().hasOnly(['emailVerified']) ||
               isEmailVerified()
             )
+          ) ||
+          (
+            isOwner(userId) &&
+            isEmailVerified() &&
+            existing().accountStatus == 'active' &&
+            incoming().uid == existing().uid &&
+            incoming().fullName == existing().fullName &&
+            incoming().username == existing().username &&
+            incoming().email == existing().email &&
+            incoming().phoneNumber == existing().phoneNumber &&
+            incoming().profileImage == existing().profileImage &&
+            incoming().referralCode == existing().referralCode &&
+            incoming().referredBy == existing().referredBy &&
+            incoming().accountStatus == existing().accountStatus &&
+            incoming().emailVerified == existing().emailVerified &&
+            incoming().createdAt == existing().createdAt &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['points', 'totalEarnings', 'totalAdViews']) &&
+            incoming().totalAdViews >= existing().totalAdViews &&
+            incoming().totalAdViews <= existing().totalAdViews + 1 &&
+            getAfter(/databases/$(database)/documents/wallets/$(userId)).data.updatedAt == request.time &&
+            incoming().points == getAfter(/databases/$(database)/documents/wallets/$(userId)).data.availablePoints &&
+            incoming().totalEarnings == getAfter(/databases/$(database)/documents/wallets/$(userId)).data.totalEarnedPoints
           )
         );
 
       allow delete: if isValidId(userId) && isSuperAdmin();
     }
 
-    // 2. Wallets Collection (Strictly server/admin governed; owner & support read-only)
+    // 2. Wallets Collection (Admin-governed + atomic >=30s verified ad reward credits)
     match /wallets/{userId} {
       allow get: if isValidId(userId) && (isOwner(userId) || isSupportAdmin());
       allow list: if isSupportAdmin();
-      allow create, update, delete: if isValidId(userId) && isAdmin();
+      allow create: if isValidId(userId) && isSignedIn() && isValidWallet(incoming()) && (
+        isAdmin() ||
+        (
+          isOwner(userId) &&
+          isEmailVerified() &&
+          incoming().userId == userId &&
+          incoming().updatedAt == request.time &&
+          ('lastTransactionId' in incoming()) &&
+          isValidTimerTxId(incoming().lastTransactionId) &&
+          incoming().pendingPoints == 0 &&
+          incoming().reservedPoints == 0 &&
+          incoming().totalWithdrawnPoints == 0 &&
+          incoming().totalWithdrawnBdt == 0 &&
+          get(/databases/$(database)/documents/adSessions/$(incoming().lastTransactionId[9:incoming().lastTransactionId.size()])).data.status == 'pending' &&
+          getAfter(/databases/$(database)/documents/adSessions/$(incoming().lastTransactionId[9:incoming().lastTransactionId.size()])).data.status == 'completed' &&
+          getAfter(/databases/$(database)/documents/adCompletions/$('comp_' + incoming().lastTransactionId[3:incoming().lastTransactionId.size()])).data.userId == userId &&
+          getAfter(/databases/$(database)/documents/adCompletions/$('comp_' + incoming().lastTransactionId[3:incoming().lastTransactionId.size()])).data.rewardPoints >= 1 &&
+          incoming().totalPoints == get(/databases/$(database)/documents/users/$(userId)).data.points + getAfter(/databases/$(database)/documents/adCompletions/$('comp_' + incoming().lastTransactionId[3:incoming().lastTransactionId.size()])).data.rewardPoints &&
+          incoming().availablePoints == get(/databases/$(database)/documents/users/$(userId)).data.points + getAfter(/databases/$(database)/documents/adCompletions/$('comp_' + incoming().lastTransactionId[3:incoming().lastTransactionId.size()])).data.rewardPoints &&
+          incoming().totalEarnedPoints == get(/databases/$(database)/documents/users/$(userId)).data.totalEarnings + getAfter(/databases/$(database)/documents/adCompletions/$('comp_' + incoming().lastTransactionId[3:incoming().lastTransactionId.size()])).data.rewardPoints
+        )
+      );
+      allow update: if isValidId(userId) && isSignedIn() && isValidWallet(incoming()) && (
+        isAdmin() ||
+        (
+          isOwner(userId) &&
+          isEmailVerified() &&
+          existing().userId == userId &&
+          incoming().userId == existing().userId &&
+          incoming().updatedAt == request.time &&
+          ('lastTransactionId' in incoming()) &&
+          isValidTimerTxId(incoming().lastTransactionId) &&
+          (!('lastTransactionId' in existing()) || incoming().lastTransactionId != existing().lastTransactionId) &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['totalPoints', 'availablePoints', 'totalEarnedPoints', 'lastTransactionId', 'updatedAt']) &&
+          incoming().pendingPoints == existing().pendingPoints &&
+          incoming().reservedPoints == existing().reservedPoints &&
+          incoming().totalWithdrawnPoints == existing().totalWithdrawnPoints &&
+          incoming().totalWithdrawnBdt == existing().totalWithdrawnBdt &&
+          get(/databases/$(database)/documents/adSessions/$(incoming().lastTransactionId[9:incoming().lastTransactionId.size()])).data.status == 'pending' &&
+          getAfter(/databases/$(database)/documents/adSessions/$(incoming().lastTransactionId[9:incoming().lastTransactionId.size()])).data.status == 'completed' &&
+          getAfter(/databases/$(database)/documents/adCompletions/$('comp_' + incoming().lastTransactionId[3:incoming().lastTransactionId.size()])).data.userId == userId &&
+          getAfter(/databases/$(database)/documents/adCompletions/$('comp_' + incoming().lastTransactionId[3:incoming().lastTransactionId.size()])).data.rewardPoints >= 1 &&
+          incoming().totalPoints == existing().totalPoints + getAfter(/databases/$(database)/documents/adCompletions/$('comp_' + incoming().lastTransactionId[3:incoming().lastTransactionId.size()])).data.rewardPoints &&
+          incoming().availablePoints == existing().availablePoints + getAfter(/databases/$(database)/documents/adCompletions/$('comp_' + incoming().lastTransactionId[3:incoming().lastTransactionId.size()])).data.rewardPoints &&
+          incoming().totalEarnedPoints == existing().totalEarnedPoints + getAfter(/databases/$(database)/documents/adCompletions/$('comp_' + incoming().lastTransactionId[3:incoming().lastTransactionId.size()])).data.rewardPoints
+        )
+      );
+      allow delete: if isValidId(userId) && isAdmin();
     }
 
-    // 3. Immutable Wallet Ledger (Strictly server/admin written; owner & support read-only)
+    // 3. Immutable Wallet Ledger (Append-only via Admin or atomic >=30s verified ad reward)
     match /walletLedger/{entryId} {
       allow get: if isValidId(entryId) && isSignedIn() && (isSupportAdmin() || (resource != null && existing().userId == request.auth.uid));
       allow list: if isSignedIn() && (existing().userId == request.auth.uid || isSupportAdmin());
-      allow create, update, delete: if isValidId(entryId) && isAdmin();
+      allow create: if isValidId(entryId) && isSignedIn() && isValidWalletLedgerEntry(incoming()) && (
+        isAdmin() ||
+        (
+          isEmailVerified() &&
+          entryId == 'led_' + incoming().transactionId &&
+          isValidTimerTxId(incoming().transactionId) &&
+          incoming().userId == request.auth.uid &&
+          incoming().entryType == 'credit' &&
+          incoming().transactionType in ['ad_reward', 'daily_bonus'] &&
+          incoming().status == 'completed' &&
+          incoming().pointsDelta >= 1 &&
+          incoming().newPoints == incoming().previousPoints + incoming().pointsDelta &&
+          incoming().newReservedPoints == incoming().previousReservedPoints &&
+          incoming().createdAt == request.time &&
+          getAfter(/databases/$(database)/documents/transactions/$(incoming().transactionId)).data.userId == request.auth.uid &&
+          getAfter(/databases/$(database)/documents/transactions/$(incoming().transactionId)).data.pointsDelta == incoming().pointsDelta
+        )
+      );
+      allow update, delete: if isValidId(entryId) && isAdmin();
     }
 
     // 4. Withdrawal Requests (Server-validated reservation; owner & support read-only)
@@ -960,7 +1168,7 @@ service cloud.firestore {
       allow delete: if isValidId(adId) && isAdmin();
     }
 
-    // 11. Ad Watching Sessions (Users can only initiate pending sessions; completion is server-only)
+    // 11. Ad Watching Sessions (Users initiate pending sessions & finalize after >=30s server clock)
     match /adSessions/{sessionId} {
       allow get: if isValidId(sessionId) && isSignedIn() && (isSupportAdmin() || (resource != null && existing().userId == request.auth.uid));
       allow list: if isSignedIn() && (existing().userId == request.auth.uid || isSupportAdmin());
@@ -968,24 +1176,43 @@ service cloud.firestore {
         isEmailVerified() &&
         isValidAdSession(incoming()) &&
         incoming().sessionId == sessionId &&
+        incoming().sessionId.size() <= 90 &&
         incoming().userId == request.auth.uid &&
         incoming().status == 'pending' &&
         incoming().transactionId == '' &&
         incoming().rejectionReason == '' &&
         incoming().createdAt == request.time &&
+        incoming().expectedRewardPoints >= 1 &&
         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.accountStatus == 'active' &&
-        exists(/databases/$(database)/documents/advertisements/$(incoming().adId)) &&
-        get(/databases/$(database)/documents/advertisements/$(incoming().adId)).data.status == 'active' &&
-        get(/databases/$(database)/documents/advertisements/$(incoming().adId)).data.rewardVerificationMethod != 'none' &&
         (
-          get(/databases/$(database)/documents/advertisements/$(incoming().adId)).data.adType != 'direct_link' ||
-          get(/databases/$(database)/documents/advertisements/$(incoming().adId)).data.incentivizedTrafficAllowed == true
+          (
+            incoming().adId == 'daily_checkin_bonus' &&
+            get(/databases/$(database)/documents/appSettings/dailyBonus).data.enabled == true &&
+            get(/databases/$(database)/documents/appSettings/dailyBonus).data.incentivizedTrafficAllowed == true &&
+            incoming().expectedRewardPoints == get(/databases/$(database)/documents/appSettings/dailyBonus).data.rewardPoints
+          ) ||
+          (
+            exists(/databases/$(database)/documents/advertisements/$(incoming().adId)) &&
+            get(/databases/$(database)/documents/advertisements/$(incoming().adId)).data.status == 'active' &&
+            get(/databases/$(database)/documents/advertisements/$(incoming().adId)).data.rewardVerificationMethod != 'none' &&
+            (
+              get(/databases/$(database)/documents/advertisements/$(incoming().adId)).data.adType != 'direct_link' ||
+              get(/databases/$(database)/documents/advertisements/$(incoming().adId)).data.incentivizedTrafficAllowed == true
+            ) &&
+            incoming().expectedRewardPoints == get(/databases/$(database)/documents/advertisements/$(incoming().adId)).data.rewardPoints
+          ) ||
+          (
+            exists(/databases/$(database)/documents/directLinkAds/$(incoming().adId)) &&
+            get(/databases/$(database)/documents/directLinkAds/$(incoming().adId)).data.status == 'active' &&
+            get(/databases/$(database)/documents/directLinkAds/$(incoming().adId)).data.incentivizedTrafficAllowed == true &&
+            get(/databases/$(database)/documents/directLinkAds/$(incoming().adId)).data.rewardVerificationMethod != 'none' &&
+            incoming().expectedRewardPoints == get(/databases/$(database)/documents/directLinkAds/$(incoming().adId)).data.rewardPoints
+          )
         );
-      allow update: if isValidId(sessionId) && (
+      allow update: if isValidId(sessionId) && isSignedIn() && isValidAdSession(incoming()) && (
         isAdmin() ||
         (
           isEmailVerified() &&
-          isValidAdSession(incoming()) &&
           existing().userId == request.auth.uid &&
           existing().status == 'pending' &&
           incoming().status == 'rejected' &&
@@ -999,37 +1226,176 @@ service cloud.firestore {
           incoming().transactionId == '' &&
           incoming().createdAt == existing().createdAt &&
           incoming().diff(existing()).affectedKeys().hasOnly(['status', 'rejectionReason'])
+        ) ||
+        (
+          isEmailVerified() &&
+          existing().userId == request.auth.uid &&
+          existing().status == 'pending' &&
+          incoming().status == 'completed' &&
+          incoming().transactionId == 'tx_timer_' + existing().sessionId &&
+          incoming().rejectionReason == '' &&
+          incoming().sessionId == existing().sessionId &&
+          incoming().userId == existing().userId &&
+          incoming().adId == existing().adId &&
+          incoming().adName == existing().adName &&
+          incoming().adNetwork == existing().adNetwork &&
+          incoming().expectedRewardPoints == existing().expectedRewardPoints &&
+          incoming().dhakaDate == existing().dhakaDate &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'transactionId', 'rejectionReason']) &&
+          request.time >= existing().createdAt + duration.value(30, 's') &&
+          existsAfter(/databases/$(database)/documents/adCompletions/$('comp_timer_' + existing().sessionId)) &&
+          existsAfter(/databases/$(database)/documents/wallets/$(request.auth.uid))
         )
       );
       allow delete: if isValidId(sessionId) && isAdmin();
     }
 
-    // 12. Server-Verified Idempotent Ad Completions (Read-only for owner & support)
+    // 12. Idempotent Ad Completions (Verified >=30s server-clock completions)
     match /adCompletions/{completionId} {
       allow get: if isValidId(completionId) && isSignedIn() && (isSupportAdmin() || (resource != null && existing().userId == request.auth.uid));
       allow list: if isSignedIn() && (existing().userId == request.auth.uid || isSupportAdmin());
-      allow create, update, delete: if isValidId(completionId) && isAdmin();
+      allow create: if isValidId(completionId) && isSignedIn() && isValidAdCompletion(incoming()) && (
+        isAdmin() ||
+        (
+          isEmailVerified() &&
+          incoming().userId == request.auth.uid &&
+          completionId == 'comp_timer_' + incoming().sessionId &&
+          incoming().providerTxId == 'timer_' + incoming().sessionId &&
+          incoming().transactionId == 'tx_timer_' + incoming().sessionId &&
+          incoming().status == 'completed' &&
+          incoming().createdAt == request.time &&
+          get(/databases/$(database)/documents/adSessions/$(incoming().sessionId)).data.status == 'pending' &&
+          get(/databases/$(database)/documents/adSessions/$(incoming().sessionId)).data.userId == request.auth.uid &&
+          get(/databases/$(database)/documents/adSessions/$(incoming().sessionId)).data.adId == incoming().adId &&
+          get(/databases/$(database)/documents/adSessions/$(incoming().sessionId)).data.dhakaDate == incoming().dhakaDate &&
+          request.time >= get(/databases/$(database)/documents/adSessions/$(incoming().sessionId)).data.createdAt + duration.value(30, 's') &&
+          getAfter(/databases/$(database)/documents/adSessions/$(incoming().sessionId)).data.status == 'completed' &&
+          (
+            (
+              incoming().adId == 'daily_checkin_bonus' &&
+              get(/databases/$(database)/documents/appSettings/dailyBonus).data.enabled == true &&
+              get(/databases/$(database)/documents/appSettings/dailyBonus).data.incentivizedTrafficAllowed == true &&
+              incoming().rewardPoints >= 1 &&
+              incoming().rewardPoints == get(/databases/$(database)/documents/appSettings/dailyBonus).data.rewardPoints
+            ) ||
+            (
+              exists(/databases/$(database)/documents/advertisements/$(incoming().adId)) &&
+              get(/databases/$(database)/documents/advertisements/$(incoming().adId)).data.status == 'active' &&
+              get(/databases/$(database)/documents/advertisements/$(incoming().adId)).data.rewardVerificationMethod != 'none' &&
+              (
+                get(/databases/$(database)/documents/advertisements/$(incoming().adId)).data.adType != 'direct_link' ||
+                get(/databases/$(database)/documents/advertisements/$(incoming().adId)).data.incentivizedTrafficAllowed == true
+              ) &&
+              incoming().rewardPoints >= 1 &&
+              incoming().rewardPoints == get(/databases/$(database)/documents/advertisements/$(incoming().adId)).data.rewardPoints
+            ) ||
+            (
+              exists(/databases/$(database)/documents/directLinkAds/$(incoming().adId)) &&
+              get(/databases/$(database)/documents/directLinkAds/$(incoming().adId)).data.status == 'active' &&
+              get(/databases/$(database)/documents/directLinkAds/$(incoming().adId)).data.incentivizedTrafficAllowed == true &&
+              get(/databases/$(database)/documents/directLinkAds/$(incoming().adId)).data.rewardVerificationMethod != 'none' &&
+              incoming().rewardPoints >= 1 &&
+              incoming().rewardPoints == get(/databases/$(database)/documents/directLinkAds/$(incoming().adId)).data.rewardPoints
+            )
+          )
+        )
+      );
+      allow update, delete: if isValidId(completionId) && isAdmin();
     }
 
-    // 13. Daily Ad Limits (Asia/Dhaka counters, read-only for owner & support)
+    // 13. Daily Ad Limits (Asia/Dhaka counters)
     match /dailyAdLimits/{limitId} {
       allow get: if isValidId(limitId) && isSignedIn() && (isSupportAdmin() || (resource == null && limitId.matches('^' + request.auth.uid + '_[0-9]{4}-[0-9]{2}-[0-9]{2}$')) || (resource != null && existing().userId == request.auth.uid));
       allow list: if isSignedIn() && (existing().userId == request.auth.uid || isSupportAdmin());
-      allow create, update, delete: if isValidId(limitId) && isAdmin();
+      allow create: if isValidId(limitId) && isSignedIn() && isValidDailyAdLimit(incoming()) && (
+        isAdmin() ||
+        (
+          isEmailVerified() &&
+          limitId == request.auth.uid + '_' + incoming().dhakaDate &&
+          incoming().userId == request.auth.uid &&
+          incoming().completedCount == 1 &&
+          ('completedAdIds' in incoming()) &&
+          incoming().completedAdIds.size() == 1 &&
+          incoming().updatedAt == request.time &&
+          getAfter(/databases/$(database)/documents/wallets/$(request.auth.uid)).data.updatedAt == request.time
+        )
+      );
+      allow update: if isValidId(limitId) && isSignedIn() && isValidDailyAdLimit(incoming()) && (
+        isAdmin() ||
+        (
+          isEmailVerified() &&
+          limitId == request.auth.uid + '_' + existing().dhakaDate &&
+          existing().userId == request.auth.uid &&
+          incoming().userId == existing().userId &&
+          incoming().dhakaDate == existing().dhakaDate &&
+          incoming().completedCount == existing().completedCount + 1 &&
+          incoming().earnedPoints > existing().earnedPoints &&
+          ('completedAdIds' in incoming()) &&
+          (!('completedAdIds' in existing()) ? incoming().completedAdIds.size() == 1 : incoming().completedAdIds.size() == existing().completedAdIds.size() + 1) &&
+          incoming().updatedAt == request.time &&
+          getAfter(/databases/$(database)/documents/wallets/$(request.auth.uid)).data.updatedAt == request.time
+        )
+      );
+      allow delete: if isValidId(limitId) && isAdmin();
     }
 
-    // 14. Server-Governed Transactions Ledger (Read-only for owner & support)
+    // 14. Transactions Ledger (Immutable append-only reward & payout ledger)
     match /transactions/{txId} {
       allow get: if isValidId(txId) && isSignedIn() && (isSupportAdmin() || (resource != null && existing().userId == request.auth.uid));
       allow list: if isSignedIn() && (existing().userId == request.auth.uid || isSupportAdmin());
-      allow create, update, delete: if isValidId(txId) && isAdmin();
+      allow create: if isValidId(txId) && isSignedIn() && isValidTransaction(incoming()) && (
+        isAdmin() ||
+        (
+          isEmailVerified() &&
+          isValidTimerTxId(txId) &&
+          ('transactionId' in incoming()) &&
+          incoming().transactionId == txId &&
+          incoming().userId == request.auth.uid &&
+          incoming().direction == 'credit' &&
+          incoming().type in ['ad_reward', 'daily_bonus'] &&
+          incoming().status == 'completed' &&
+          incoming().pointsDelta >= 1 &&
+          ('points' in incoming()) &&
+          incoming().points == incoming().pointsDelta &&
+          incoming().createdAt == request.time &&
+          getAfter(/databases/$(database)/documents/adCompletions/$('comp_' + txId[3:txId.size()])).data.userId == request.auth.uid &&
+          getAfter(/databases/$(database)/documents/adCompletions/$('comp_' + txId[3:txId.size()])).data.rewardPoints == incoming().pointsDelta
+        )
+      );
+      allow update, delete: if isValidId(txId) && isAdmin();
     }
 
-    // 15. Server-Governed Daily Bonus Streak State
+    // 15. Daily Bonus Streak State (Once-per-day claim synced atomically with wallet credit)
     match /dailyBonuses/{userId} {
       allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
       allow list: if isAdmin();
-      allow create, update, delete: if isValidId(userId) && isAdmin();
+      allow create: if isValidId(userId) && isSignedIn() && isValidDailyBonusState(incoming()) && (
+        isAdmin() ||
+        (
+          isOwner(userId) &&
+          isEmailVerified() &&
+          incoming().uid == request.auth.uid &&
+          incoming().streakDays == 1 &&
+          incoming().updatedAt == request.time &&
+          getAfter(/databases/$(database)/documents/wallets/$(request.auth.uid)).data.updatedAt == request.time
+        )
+      );
+      allow update: if isValidId(userId) && isSignedIn() && isValidDailyBonusState(incoming()) && (
+        isAdmin() ||
+        (
+          isOwner(userId) &&
+          isEmailVerified() &&
+          existing().uid == request.auth.uid &&
+          incoming().uid == existing().uid &&
+          incoming().lastClaimDate != existing().lastClaimDate &&
+          incoming().streakDays >= 1 &&
+          incoming().streakDays <= existing().streakDays + 1 &&
+          incoming().updatedAt == request.time &&
+          getAfter(/databases/$(database)/documents/wallets/$(request.auth.uid)).data.updatedAt == request.time
+        )
+      );
+      allow delete: if isValidId(userId) && isAdmin();
     }
 
     // 16. Fraud & Suspicious Callback Logs (Support/Admin read, Admin/Server write)

@@ -233,7 +233,9 @@ export const AdminAdManagerModal: React.FC<AdminAdManagerModalProps> = ({
     }
   };
 
-  const postbackTemplate = `https://us-central1-${activeFirebaseConfig.projectId}.cloudfunctions.net/verifyAdNetworkCallback?net=monetag&session_id={ymid}&user_id={subid}&provider_tx_id={click_id}&reward_event_type={reward_event_type}&secret=YOUR_MONETAG_CALLBACK_SECRET`;
+  const callbackOrigin =
+    typeof window !== 'undefined' && window.location?.origin ? window.location.origin : '';
+  const postbackTemplate = `${callbackOrigin}/api/verifyAdNetworkCallback?net=monetag&ymid={ymid}&session_id={ymid}&reward_event_type={reward_event_type}&zone_id={zone_id}&estimated_price={estimated_price}&var={request_var}&secret=YOUR_MONETAG_CALLBACK_SECRET`;
 
   const copyPostback = async () => {
     try {

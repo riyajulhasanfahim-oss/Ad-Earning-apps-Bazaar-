@@ -39,6 +39,7 @@
         "totalEarnedPoints": { "type": "number" },
         "totalWithdrawnPoints": { "type": "number" },
         "totalWithdrawnBdt": { "type": "number" },
+        "lastTransactionId": { "type": "string", "maxLength": 128 },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": [

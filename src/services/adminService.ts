@@ -862,6 +862,9 @@ async function callAdminCloudFunction<T = Record<string, unknown>>(
   functionName: string,
   payload: Record<string, unknown>,
 ): Promise<{ reached: boolean; ok: boolean; data?: T; error?: string }> {
+  if (import.meta.env.VITE_ENABLE_CLOUD_FUNCTIONS_FALLBACK !== 'true') {
+    return { reached: false, ok: false, error: 'Cloud Functions fallback not enabled.' };
+  }
   const currentUser = auth.currentUser;
   if (!currentUser) {
     return { reached: false, ok: false, error: 'Authentication required.' };

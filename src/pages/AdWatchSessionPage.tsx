@@ -453,12 +453,12 @@ export const AdWatchSessionPage: React.FC<AdWatchSessionPageProps> = ({
               <Clock className="w-6 h-6 text-amber-300 shrink-0 mt-0.5" />
               <div className="space-y-1">
                 <p className="text-sm font-extrabold text-amber-200">
-                  Verification Pending from Ad Network
+                  Reward Confirmation Pending
                 </p>
                 <p className="text-xs text-slate-200 leading-relaxed">
                   {lastCallbackError
                     ? lastCallbackError
-                    : `${ad.adNetwork} S2S postback has not arrived yet. Please keep the ad tab open briefly, then tap Retry Verification.`}
+                    : 'Reward confirmation took longer than expected. Tap Retry Verification to finish adding your points.'}
                 </p>
               </div>
             </div>
@@ -486,7 +486,7 @@ export const AdWatchSessionPage: React.FC<AdWatchSessionPageProps> = ({
                     ? sdkStatus === 'launching'
                       ? 'Complete viewing the video ad to trigger reward confirmation.'
                       : 'Finalizing verified reward with server...'
-                    : `Verifying reward with ${ad.adNetwork}... (${verifyRemainingSec}s)`}
+                    : `Adding +${formatPoints(ad.rewardPoints)} Pts to your wallet... (${verifyRemainingSec}s)`}
               </p>
               {timerDone && lastCallbackError && (
                 <p className="text-[11px] text-amber-200 mt-1">{lastCallbackError}</p>

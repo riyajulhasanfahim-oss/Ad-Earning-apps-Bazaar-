@@ -834,14 +834,14 @@ async function handleVerifiedPostbackOrSdkCompletion(req, res) {
         customDataSessionId = stripMacro(obj.sessionId || obj.session_id);
         customDataAdId = stripMacro(obj.adId || obj.ad_id);
     }
-    const rawSessionToken = stripMacro(source.sessionId ||
+    const rawSessionToken = stripMacro(source.ymid ||
+        source.sessionId ||
         source.session_id ||
-        source.ymid ||
         source.request_var ||
         customDataSessionId ||
         source.custom1);
     const sessionId = rawSessionToken ? (0, helpers_1.sanitizeId)(rawSessionToken).replace(/^id_\d+$/, '') : '';
-    const rawUserId = stripMacro(source.userId || source.user_id || source.userid || source.subid);
+    const rawUserId = stripMacro(source.userId || source.user_id || source.userid || source.var);
     let userId = rawUserId;
     let adId = stripMacro(source.adId || source.ad_id || customDataAdId || source.custom2);
     const gameApiKey = stripMacro(source.gameApiKey);
@@ -867,39 +867,42 @@ async function handleVerifiedPostbackOrSdkCompletion(req, res) {
         source.provider_tx_id ||
         source.tx_id ||
         source.transaction_id ||
-        source.click_id ||
-        source.clickid ||
         source.conversion_id ||
         source.request_id ||
         tid);
     const rawTimestamp = source.ts ?? source.timestamp ?? req.headers['x-postback-timestamp'];
     const providedSecret = stripMacro(req.headers['x-postback-secret'] || source.secret);
     const providedSignature = stripMacro(req.headers['x-postback-signature'] || source.sig);
-    // Hydrate adId, userId, and networkId when omitted from server-created adSessions/{sessionId}
-    if (sessionId && (!adId || !userId || !networkId)) {
-        try {
-            const sessSnap = await helpers_1.db.collection('adSessions').doc(sessionId).get();
-            if (sessSnap.exists) {
-                const sess = sessSnap.data();
-                if (!adId && typeof sess.adId === 'string') {
-                    adId = String(sess.adId).trim();
-                }
-                if (!userId && typeof sess.userId === 'string') {
-                    userId = String(sess.userId).trim();
-                }
-                if (!networkId && typeof sess.adNetwork === 'string') {
-                    const netLower = String(sess.adNetwork).toLowerCase();
-                    if (netLower.includes('monetag'))
-                        networkId = 'monetag';
-                    else if (netLower.includes('applixir'))
-                        networkId = 'applixir';
-                    else if (netLower.includes('adsterra'))
-                        networkId = 'adsterra';
-                }
-            }
+    // Strictly bind ymid (sessionId) to server-created adSessions/{sessionId}
+    if (sessionId) {
+        const sessSnap = await helpers_1.db.collection('adSessions').doc(sessionId).get();
+        if (!sessSnap.exists) {
+            res.status(404).json({ ok: false, error: 'SESSION_NOT_FOUND' });
+            return;
         }
-        catch {
-            // Downstream parameter validation handles missing fields safely
+        const sess = sessSnap.data();
+        const boundUserId = typeof sess.userId === 'string' ? String(sess.userId).trim() : '';
+        const boundAdId = typeof sess.adId === 'string' ? String(sess.adId).trim() : '';
+        if (userId && boundUserId && userId !== boundUserId) {
+            res.status(403).json({ ok: false, error: 'SESSION_MISMATCH' });
+            return;
+        }
+        if (adId && boundAdId && adId !== boundAdId) {
+            res.status(403).json({ ok: false, error: 'SESSION_MISMATCH' });
+            return;
+        }
+        if (boundUserId)
+            userId = boundUserId;
+        if (boundAdId)
+            adId = boundAdId;
+        if (!networkId && typeof sess.adNetwork === 'string') {
+            const netLower = String(sess.adNetwork).toLowerCase();
+            if (netLower.includes('monetag'))
+                networkId = 'monetag';
+            else if (netLower.includes('applixir'))
+                networkId = 'applixir';
+            else if (netLower.includes('adsterra'))
+                networkId = 'adsterra';
         }
     }
     if (!providerTxId && networkId.toLowerCase() === 'monetag' && sessionId) {
@@ -1398,6 +1401,7 @@ exports.verifyAdSessionReward = (0, https_1.onRequest)({ cors: true }, async (re
         }
         // Surface definitive provider/policy rejections immediately instead of timing out
         const terminalReasons = new Set([
+            'MONETAG_EVENT_NON_VALUED',
             'MONETAG_EVENT_NOT_VALUED',
             'APPLIXIR_STATUS_NOT_COMPLETED',
             'NETWORK_DISABLED',
@@ -1437,9 +1441,16 @@ exports.verifyAdSessionReward = (0, https_1.onRequest)({ cors: true }, async (re
         const placementVal = isDailyBonus
             ? String(adOrBonusData.monetagDirectLinkUrl || '')
             : String(adOrBonusData.placementOrUrl || '');
-        const isAppLixir = adNetworkName.toLowerCase().includes('applixir') || /^applixir:/i.test(placementVal.trim());
-        // AppLixir strictly requires MD5+TID S2S callback; never credit without callback
-        if (isAppLixir) {
+        const adNetLower = adNetworkName.toLowerCase();
+        const isAppLixir = adNetLower.includes('applixir') || /^applixir:/i.test(placementVal.trim());
+        const isMonetag = adNetLower.includes('monetag');
+        const requiresS2SPostback = isAppLixir ||
+            isMonetag ||
+            isDailyBonus ||
+            adOrBonusData.rewardVerificationMethod === 's2s_postback' ||
+            adOrBonusData.adType === 'direct_link';
+        // S2S Postback networks (Monetag, AppLixir, Direct Links, Daily Bonus) MUST wait for verified S2S Postback
+        if (requiresS2SPostback) {
             res.status(200).json({
                 ok: true,
                 status: 'pending',
@@ -1469,9 +1480,8 @@ exports.verifyAdSessionReward = (0, https_1.onRequest)({ cors: true }, async (re
                     networkId,
                     networkName: adNetworkName,
                     dhakaDate: dhakaToday,
-                    clicksSupported: true,
+                    clicksSupported: false,
                     deltaImpressions: 1,
-                    deltaClicks: 1,
                     deltaVerified: 1,
                     deltaRewards: outcome.rewardPoints,
                 }),
@@ -3907,17 +3917,15 @@ function buildServerDailyBonusLaunchUrl(rawUrl, sessionId, userId) {
     try {
         const resolved = trimmed
             .replace(/\{sessionId\}|\{session_id\}|\{ymid\}/gi, encodeURIComponent(sessionId))
-            .replace(/\{userId\}|\{user_id\}|\{subid\}/gi, encodeURIComponent(userId))
+            .replace(/\{userId\}|\{user_id\}|\{var\}|\{request_var\}/gi, encodeURIComponent(userId))
             .replace(/\{adId\}|\{ad_id\}/gi, encodeURIComponent(helpers_1.DAILY_CHECKIN_BONUS_AD_ID));
         const url = new URL(resolved);
         if (url.protocol !== 'https:')
             return null;
-        if (!url.searchParams.has('session_id'))
-            url.searchParams.set('session_id', sessionId);
         if (!url.searchParams.has('ymid'))
             url.searchParams.set('ymid', sessionId);
-        if (!url.searchParams.has('subid'))
-            url.searchParams.set('subid', userId);
+        if (!url.searchParams.has('var'))
+            url.searchParams.set('var', userId);
         return url.toString();
     }
     catch {
@@ -4024,6 +4032,7 @@ exports.startDailyBonusSession = (0, https_1.onRequest)({ cors: true }, async (r
         res.status(200).json({
             ok: true,
             sessionId,
+            ymid: sessionId,
             adId: helpers_1.DAILY_CHECKIN_BONUS_AD_ID,
             dhakaDate: dhakaToday,
             rewardPoints,

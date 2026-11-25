@@ -699,13 +699,13 @@ export const AdminSettingsSection: React.FC<AdminSettingsSectionProps> = ({
                 disabled={!canManageEconomy}
                 value={dbUrl}
                 onChange={(e) => setDbUrl(e.target.value)}
-                placeholder="https://your-monetag-direct-link.example/...?ymid={ymid}&subid={subid}"
+                placeholder="https://your-monetag-direct-link.example/...?ymid={ymid}&var={request_var}"
                 className="w-full h-10 px-3 rounded-xl bg-[#070B22] border border-white/15 text-white font-mono-num disabled:opacity-50"
               />
               <p className="text-[11px] text-slate-400">
-                Our server automatically appends <span className="font-mono-num">ymid</span>,{' '}
-                <span className="font-mono-num">session_id</span>, and{' '}
-                <span className="font-mono-num">subid</span> for S2S verification.
+                Our server automatically appends <span className="font-mono-num">ymid</span>{' '}
+                (unique session ID) and <span className="font-mono-num">var</span> (user ID) for
+                Monetag S2S verification.
               </p>
             </div>
 

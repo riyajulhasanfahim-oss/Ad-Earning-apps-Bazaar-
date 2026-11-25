@@ -1,172 +1,221 @@
-import crypto from 'node:crypto';
 import type { ServerResponse } from 'node:http';
+import { FieldValue } from 'firebase-admin/firestore';
 import {
   type ApiRequest,
   applyCors,
-  buildSetWrite,
-  createFirestoreContext,
   DAILY_CHECKIN_BONUS_AD_ID,
-  DEFAULT_GLOBAL_DAILY_AD_LIMIT,
-  fsCommit,
-  fsGetDoc,
+  getAppLixirBackendEnvStatus,
   getDhakaDateKey,
+  getFirebaseAdminContext,
+  isCredentialOrPermissionError,
+  isValidAppLixirSiteOrKey,
   normalizeAdDurationSeconds,
   readJsonBody,
   resolveTargetFirebase,
   sanitizeId,
+  sendBackendUnavailable,
   sendJson,
-  SERVER_TIMESTAMP_SENTINEL,
-  verifyFirebaseIdToken,
-} from './_firebaseAdminRest.ts';
+  verifyAuthAndRoleAdmin,
+} from './_firebaseAdmin.ts';
+import {
+  enforceRateLimitAdmin,
+  generateSessionId,
+  readActiveAppSettingsAdmin,
+} from './_rewardEngine.ts';
 
 export default async function handler(req: ApiRequest, res: ServerResponse): Promise<void> {
   if (req.method === 'OPTIONS') {
-    applyCors(res);
+    applyCors(req, res);
     res.statusCode = 204;
     res.end();
     return;
   }
   if (req.method !== 'POST') {
-    sendJson(res, 405, { ok: false, error: 'Method not allowed' });
+    sendJson(req, res, 405, { ok: false, error: 'Method not allowed' });
     return;
   }
 
   const { projectId, databaseId } = resolveTargetFirebase(req);
-  if (!projectId) {
-    sendJson(res, 503, {
-      ok: false,
-      status: 'backend_unavailable',
-      backendConfigured: false,
-      error: 'SERVER_CREDENTIALS_MISSING',
-    });
-    return;
-  }
-
-  const authCheck = await verifyFirebaseIdToken(req, projectId);
-  if (!authCheck.auth) {
-    sendJson(res, authCheck.status || 401, { ok: false, error: authCheck.error || 'Unauthorized' });
-    return;
-  }
-
-  const ctx = await createFirestoreContext(projectId, databaseId);
+  const ctx = getFirebaseAdminContext(projectId, databaseId);
   if (!ctx) {
-    sendJson(res, 503, {
+    sendBackendUnavailable(req, res);
+    return;
+  }
+
+  const authCheck = await verifyAuthAndRoleAdmin(req, ctx, { requireVerifiedEmail: true });
+  if (!authCheck.auth) {
+    sendJson(req, res, authCheck.status || 401, {
       ok: false,
-      status: 'backend_unavailable',
-      backendConfigured: false,
-      error: 'SERVER_CREDENTIALS_MISSING',
+      error: authCheck.error || 'Unauthorized',
     });
     return;
   }
 
   const body = await readJsonBody(req);
   const adId = sanitizeId(String(body.adId || ''));
-  if (!adId) {
-    sendJson(res, 400, { ok: false, error: 'Missing adId' });
+  if (!adId || !String(body.adId || '').trim()) {
+    sendJson(req, res, 400, { ok: false, error: 'Missing adId' });
     return;
   }
   if (adId === DAILY_CHECKIN_BONUS_AD_ID) {
-    sendJson(res, 403, { ok: false, error: 'USE_DAILY_BONUS_ENDPOINT' });
+    sendJson(req, res, 403, { ok: false, error: 'USE_DAILY_BONUS_ENDPOINT' });
     return;
   }
 
   const uid = authCheck.auth.uid;
-  const dhakaToday = getDhakaDateKey();
-  const sessionId = sanitizeId(
-    `sess_${Date.now()}_${uid.slice(0, 6)}_${crypto.randomBytes(6).toString('hex')}`,
-  );
 
   try {
-    const [walletSettingsSnap, userSnap, adSnap, dailySnap] = await Promise.all([
-      fsGetDoc(ctx, 'appSettings/wallet'),
-      fsGetDoc(ctx, `users/${uid}`),
-      fsGetDoc(ctx, `advertisements/${adId}`),
-      fsGetDoc(ctx, `dailyAdLimits/${uid}_${dhakaToday}`),
+    const rate = await enforceRateLimitAdmin(ctx, {
+      bucketKey: `ad_sess_${uid}`,
+      actionName: 'createAdSession',
+      actorId: uid,
+      maxRequests: 15,
+      windowSeconds: 60,
+    });
+    if (!rate.allowed) {
+      sendJson(req, res, 429, {
+        ok: false,
+        error: 'RATE_LIMIT_EXCEEDED',
+        retryAfterSec: rate.retryAfterSec,
+      });
+      return;
+    }
+
+    const dhakaToday = getDhakaDateKey();
+    const sessionId = generateSessionId('sess', uid);
+
+    const [settings, userSnap, adSnapPrimary, directLinkSnap, dailySnap] = await Promise.all([
+      readActiveAppSettingsAdmin(ctx),
+      ctx.db.collection('users').doc(uid).get(),
+      ctx.db.collection('advertisements').doc(adId).get(),
+      ctx.db.collection('directLinkAds').doc(adId).get(),
+      ctx.db.collection('dailyAdLimits').doc(`${uid}_${dhakaToday}`).get(),
     ]);
 
-    const earningEnabled =
-      walletSettingsSnap.exists && typeof walletSettingsSnap.data.earningEnabled === 'boolean'
-        ? Boolean(walletSettingsSnap.data.earningEnabled)
-        : true;
-    const dailyAdLimit = Math.max(
-      1,
-      Number(walletSettingsSnap.data.dailyAdLimit || DEFAULT_GLOBAL_DAILY_AD_LIMIT),
-    );
-
-    if (!earningEnabled) {
-      sendJson(res, 403, { ok: false, error: 'EARNING_DISABLED' });
+    if (!settings.earningEnabled) {
+      sendJson(req, res, 403, { ok: false, error: 'EARNING_DISABLED' });
       return;
     }
-    if (!userSnap.exists || userSnap.data.accountStatus !== 'active') {
-      sendJson(res, 403, { ok: false, error: 'USER_NOT_ACTIVE' });
+    if (!userSnap.exists || userSnap.data()!.accountStatus !== 'active') {
+      sendJson(req, res, 403, { ok: false, error: 'USER_NOT_ACTIVE' });
       return;
     }
+    const adSnap = adSnapPrimary.exists ? adSnapPrimary : directLinkSnap;
     if (!adSnap.exists) {
-      sendJson(res, 404, { ok: false, error: 'AD_NOT_FOUND' });
+      sendJson(req, res, 404, { ok: false, error: 'AD_NOT_FOUND' });
       return;
     }
 
-    const adData = adSnap.data;
+    const adData = adSnap.data()!;
+    const isDirectLinkDoc = !adSnapPrimary.exists && directLinkSnap.exists;
     if (adData.status !== 'active' || adData.rewardVerificationMethod === 'none') {
-      sendJson(res, 403, { ok: false, error: 'AD_NOT_ELIGIBLE' });
+      sendJson(req, res, 403, { ok: false, error: 'AD_NOT_ELIGIBLE' });
       return;
     }
-    if (adData.adType === 'direct_link' && adData.incentivizedTrafficAllowed !== true) {
-      sendJson(res, 403, { ok: false, error: 'INCENTIVIZED_TRAFFIC_DISALLOWED' });
+    if ((isDirectLinkDoc || adData.adType === 'direct_link') && adData.incentivizedTrafficAllowed !== true) {
+      sendJson(req, res, 403, { ok: false, error: 'INCENTIVIZED_TRAFFIC_DISALLOWED' });
       return;
     }
 
     const adNetLower = String(adData.adNetwork || '').toLowerCase();
-    const placementStr = String(adData.placementOrUrl || '').trim();
-    if (adNetLower.includes('applixir') || /^applixir:/i.test(placementStr)) {
-      sendJson(res, 412, { ok: false, error: 'APPLIXIR_NOT_CONFIGURED' });
-      return;
+    const placementStr = String(adData.placementOrUrl || adData.url || '').trim();
+    const isAppLixirAd = adNetLower.includes('applixir') || /^applixir:/i.test(placementStr);
+
+    if (isAppLixirAd) {
+      if (adData.rewardVerificationMethod !== 's2s_postback') {
+        sendJson(req, res, 403, { ok: false, error: 'S2S_POSTBACK_REQUIRED' });
+        return;
+      }
+      const [appNetSnap, appSecSnap] = await Promise.all([
+        ctx.db.collection('adNetworks').doc('applixir').get(),
+        ctx.db.collection('adNetworkSecrets').doc('applixir').get(),
+      ]);
+      const appNet = appNetSnap.exists ? appNetSnap.data()! : null;
+      const appSec = appSecSnap.exists ? appSecSnap.data()! : {};
+      if (appNet && appNet.enabled === false) {
+        sendJson(req, res, 403, { ok: false, error: 'NETWORK_DISABLED' });
+        return;
+      }
+      if (appNet && appNet.rewardEnabled === false) {
+        sendJson(req, res, 403, { ok: false, error: 'NETWORK_REWARD_NOT_ELIGIBLE' });
+        return;
+      }
+
+      const envStatus = getAppLixirBackendEnvStatus();
+      const hasSiteId =
+        isValidAppLixirSiteOrKey(placementStr) ||
+        isValidAppLixirSiteOrKey(String(appNet?.websiteId || '')) ||
+        isValidAppLixirSiteOrKey(String(appNet?.placementId || '')) ||
+        envStatus.siteIdConfigured;
+      const hasSecretKey =
+        envStatus.secretKeyConfigured || Boolean(String(appSec.callbackSecret || '').trim());
+      const hasApiKey =
+        envStatus.apiKeyConfigured || Boolean(String(appSec.apiKey || '').trim());
+
+      if (!hasSiteId || !hasSecretKey || !hasApiKey) {
+        sendJson(req, res, 412, {
+          ok: false,
+          error: 'APPLIXIR_NOT_CONFIGURED',
+          missing: {
+            siteId: !hasSiteId,
+            apiKey: !hasApiKey,
+            secretKey: !hasSecretKey,
+          },
+        });
+        return;
+      }
     }
 
-    const completedCount = Number(dailySnap.data.completedCount || 0);
-    const completedAdIds: string[] = Array.isArray(dailySnap.data.completedAdIds)
-      ? (dailySnap.data.completedAdIds as unknown[]).map((x) => String(x))
+    const daily = dailySnap.exists ? dailySnap.data()! : {};
+    const completedCount = Number(daily.completedCount || 0);
+    const completedAdIds: string[] = Array.isArray(daily.completedAdIds)
+      ? daily.completedAdIds.map((x: unknown) => String(x))
       : [];
 
-    if (completedCount >= dailyAdLimit) {
-      sendJson(res, 429, { ok: false, error: 'GLOBAL_DAILY_LIMIT_REACHED' });
+    if (completedCount >= settings.dailyAdLimit) {
+      sendJson(req, res, 429, { ok: false, error: 'GLOBAL_DAILY_LIMIT_REACHED' });
       return;
     }
-    if (completedAdIds.filter((id) => id === adId).length >= Math.max(1, Number(adData.dailyLimit || 1))) {
-      sendJson(res, 429, { ok: false, error: 'PER_AD_DAILY_LIMIT_REACHED' });
+    const perAdCount = completedAdIds.filter((id) => id === adId).length;
+    if (perAdCount >= Math.max(1, Number(adData.dailyLimit || 1))) {
+      sendJson(req, res, 429, { ok: false, error: 'PER_AD_DAILY_LIMIT_REACHED' });
       return;
     }
 
     const requiredDurationSec = normalizeAdDurationSeconds(adData.estimatedDuration);
-    const writes = buildSetWrite(
-      ctx,
-      `adSessions/${sessionId}`,
-      {
-        sessionId,
-        userId: uid,
-        adId,
-        adName: String(adData.adName || 'Sponsored Ad').slice(0, 100),
-        adNetwork: String(adData.adNetwork || 'Partner Network').slice(0, 60),
-        expectedRewardPoints: Number(adData.rewardPoints || 0),
-        dhakaDate: dhakaToday,
-        status: 'pending',
-        transactionId: '',
-        rejectionReason: '',
-        createdAt: SERVER_TIMESTAMP_SENTINEL,
-      },
-      { createOnly: true },
-    );
-    await fsCommit(ctx, writes);
 
-    sendJson(res, 200, {
+    await ctx.db.collection('adSessions').doc(sessionId).create({
+      sessionId,
+      userId: uid,
+      adId,
+      adName: String(adData.adName || 'Sponsored Ad').slice(0, 100),
+      adNetwork: String(adData.adNetwork || 'Partner Network').slice(0, 60),
+      expectedRewardPoints: Number(adData.rewardPoints || 0),
+      dhakaDate: dhakaToday,
+      status: 'pending',
+      transactionId: '',
+      rejectionReason: '',
+      createdAt: FieldValue.serverTimestamp(),
+    });
+
+    sendJson(req, res, 200, {
       ok: true,
       sessionId,
+      ymid: sessionId,
       adId,
       dhakaDate: dhakaToday,
       requiredDurationSec,
     });
   } catch (err) {
-    sendJson(res, 500, {
+    if (isCredentialOrPermissionError(err)) {
+      sendBackendUnavailable(
+        req,
+        res,
+        'Firebase Admin credentials lack Firestore access for this project.',
+      );
+      return;
+    }
+    sendJson(req, res, 500, {
       ok: false,
       error: err instanceof Error ? err.message : 'CREATE_AD_SESSION_FAILED',
     });

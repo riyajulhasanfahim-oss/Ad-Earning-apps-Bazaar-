@@ -203,38 +203,40 @@ export async function executeFraudReviewAction(params: {
 
   const { reportId, action, resolutionNote = '', adminUser } = params;
 
-  try {
-    const [idToken, appCheckHeaders] = await Promise.all([
-      currentUser.getIdToken(),
-      getAppCheckTokenHeader(),
-    ]);
-    const endpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/reviewFraudReport`;
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${idToken}`,
-        ...appCheckHeaders,
-      },
-      body: JSON.stringify({
-        reportId,
-        action,
-        resolutionNote: resolutionNote.trim(),
-      }),
-    });
-    if (response.ok) return;
-    if (response.status >= 400 && response.status < 500 && response.status !== 404) {
-      const body = (await response.json().catch(() => ({}))) as { error?: string };
-      throw new Error(body.error || 'Fraud review action rejected.');
-    }
-  } catch (err) {
-    if (
-      err instanceof Error &&
-      !err.message.includes('Failed to fetch') &&
-      !err.message.includes('NetworkError') &&
-      !err.message.includes('Load failed')
-    ) {
-      throw err;
+  if (import.meta.env.VITE_ENABLE_CLOUD_FUNCTIONS_FALLBACK === 'true') {
+    try {
+      const [idToken, appCheckHeaders] = await Promise.all([
+        currentUser.getIdToken(),
+        getAppCheckTokenHeader(),
+      ]);
+      const endpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/reviewFraudReport`;
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+          ...appCheckHeaders,
+        },
+        body: JSON.stringify({
+          reportId,
+          action,
+          resolutionNote: resolutionNote.trim(),
+        }),
+      });
+      if (response.ok) return;
+      if (response.status >= 400 && response.status < 500 && response.status !== 404) {
+        const body = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new Error(body.error || 'Fraud review action rejected.');
+      }
+    } catch (err) {
+      if (
+        err instanceof Error &&
+        !err.message.includes('Failed to fetch') &&
+        !err.message.includes('NetworkError') &&
+        !err.message.includes('Load failed')
+      ) {
+        throw err;
+      }
     }
   }
 

@@ -45,14 +45,19 @@ function formatTs(ts: unknown): { label: string; millis: number } {
 
 export function getCanonicalCallbackUrl(networkId: string): string {
   const clean = networkId.trim().toLowerCase();
+  const origin =
+    typeof window !== 'undefined' && window.location?.origin
+      ? window.location.origin
+      : '';
+  const endpointBase = `${origin}/api/verifyAdNetworkCallback`;
   if (clean === 'applixir') {
-    return `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/verifyAdNetworkCallback?net=applixir`;
+    return `${endpointBase}?net=applixir`;
   }
   if (clean === 'monetag') {
-    return `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/verifyAdNetworkCallback?net=monetag&session_id={ymid}&user_id={subid}&provider_tx_id={click_id}&reward_event_type={reward_event_type}&secret=YOUR_MONETAG_CALLBACK_SECRET`;
+    return `${endpointBase}?net=monetag&ymid={ymid}&session_id={ymid}&reward_event_type={reward_event_type}&zone_id={zone_id}&estimated_price={estimated_price}&var={request_var}&secret=YOUR_MONETAG_CALLBACK_SECRET`;
   }
   const cleanId = encodeURIComponent(networkId || 'monetag');
-  return `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/verifyAdNetworkCallback?net=${cleanId}&session_id={ymid}&user_id={subid}&provider_tx_id={tx_id}&ad_id={ad_id}&ts={ts}&sig={sig}`;
+  return `${endpointBase}?net=${cleanId}&ymid={ymid}&session_id={ymid}&user_id={user_id}&provider_tx_id={tx_id}&ad_id={ad_id}&ts={ts}&sig={sig}`;
 }
 
 export function getDefaultNetworkTemplates(): AdNetworkConfig[] {
@@ -98,7 +103,8 @@ export function getDefaultNetworkTemplates(): AdNetworkConfig[] {
       directLinkUrl: '',
       apiBaseUrl: '',
       callbackUrl: getCanonicalCallbackUrl('monetag'),
-      postbackParamsTemplate: 'ymid={session_id}&subid={user_id}&tx_id={provider_tx_id}&ts={ts}&sig={hmac}',
+      postbackParamsTemplate:
+        'ymid={ymid}&reward_event_type={reward_event_type}&zone_id={zone_id}&estimated_price={estimated_price}&var={request_var}',
       incentivizedTrafficAllowed: true,
       rewardVerificationSupported: true,
       rewardEnabled: false,
@@ -125,7 +131,7 @@ export function getDefaultNetworkTemplates(): AdNetworkConfig[] {
       directLinkUrl: '',
       apiBaseUrl: 'https://api3.adsterratools.com/publisher',
       callbackUrl: getCanonicalCallbackUrl('adsterra'),
-      postbackParamsTemplate: 'subid={user_id}&ymid={session_id}&tx_id={provider_tx_id}&ts={ts}',
+      postbackParamsTemplate: 'user_id={user_id}&ymid={session_id}&tx_id={provider_tx_id}&ts={ts}',
       incentivizedTrafficAllowed: false,
       rewardVerificationSupported: false,
       rewardEnabled: false,
@@ -467,6 +473,70 @@ async function invokeAdNetworkCloudFunction<T = Record<string, unknown>>(
     currentUser.getIdToken(),
     getAppCheckTokenHeader(),
   ]);
+
+  if (typeof window !== 'undefined') {
+    try {
+      const healthResp = await fetch('/api/health?probe=light', {
+        method: 'GET',
+        headers: {
+          'X-Firebase-Project-Id': firebaseConfig.projectId,
+          'X-Firestore-Database-Id': firebaseConfig.firestoreDatabaseId || '(default)',
+        },
+      });
+      const healthJson = healthResp.ok
+        ? ((await healthResp.json().catch(() => null)) as {
+            firestoreAccessVerified?: boolean;
+            serverCredentialsConfigured?: boolean;
+          } | null)
+        : null;
+      const apiReady = Boolean(
+        healthJson?.firestoreAccessVerified ?? healthJson?.serverCredentialsConfigured,
+      );
+      if (apiReady) {
+        const apiResp = await fetch(`/api/${functionName}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`,
+            'X-Firebase-Project-Id': firebaseConfig.projectId,
+            'X-Firestore-Database-Id': firebaseConfig.firestoreDatabaseId || '(default)',
+            ...appCheckHeaders,
+          },
+          body: JSON.stringify(payload),
+        });
+        const contentType = apiResp.headers.get('content-type') || '';
+        if (apiResp.status !== 404 && contentType.includes('application/json')) {
+          const body = (await apiResp.json().catch(() => ({}))) as {
+            ok?: boolean;
+            error?: string;
+            backendConfigured?: boolean;
+          } & T;
+          if (apiResp.status === 503 && body.backendConfigured === false) {
+            // Fall through
+          } else if (!apiResp.ok || !body.ok) {
+            return {
+              reached: true,
+              ok: false,
+              error: body.error || `Request failed (${apiResp.status})`,
+            };
+          } else {
+            return { reached: true, ok: true, data: body };
+          }
+        }
+      }
+    } catch {
+      // Fall through
+    }
+  }
+
+  if (import.meta.env.VITE_ENABLE_CLOUD_FUNCTIONS_FALLBACK !== 'true') {
+    return {
+      reached: false,
+      ok: false,
+      error: 'Backend endpoint not configured yet.',
+    };
+  }
+
   const endpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/${functionName}`;
 
   try {
@@ -481,7 +551,7 @@ async function invokeAdNetworkCloudFunction<T = Record<string, unknown>>(
     });
 
     if (response.status === 404) {
-      return { reached: false, ok: false, error: 'Cloud Function not deployed yet.' };
+      return { reached: false, ok: false, error: 'Backend endpoint not deployed yet.' };
     }
     const body = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string } & T;
     if (!response.ok || !body.ok) {
@@ -493,7 +563,7 @@ async function invokeAdNetworkCloudFunction<T = Record<string, unknown>>(
     }
     return { reached: true, ok: true, data: body };
   } catch {
-    return { reached: false, ok: false, error: 'Cloud Function unreachable.' };
+    return { reached: false, ok: false, error: 'Backend endpoint unreachable.' };
   }
 }
 

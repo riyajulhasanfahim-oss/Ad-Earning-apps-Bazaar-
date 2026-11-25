@@ -615,8 +615,10 @@ export const AD_SESSION_ERROR_MESSAGES: Record<string, string> = {
     'This ad requires verified Ad Network S2S postback confirmation.',
   MONETAG_SDK_REQUIRES_TELEGRAM_MINI_APP:
     'Monetag Rewarded Interstitial SDK is only supported inside Telegram Mini Apps and cannot be used on regular websites.',
+  MONETAG_EVENT_NON_VALUED:
+    'Monetag reported this impression as non_valued. Complete viewing the ad to earn points.',
   MONETAG_EVENT_NOT_VALUED:
-    'Monetag reported this impression as non-valued (not_valued). Complete viewing the ad to earn points.',
+    'Monetag reported this impression as non_valued. Complete viewing the ad to earn points.',
   APPLIXIR_STATUS_NOT_COMPLETED:
     'AppLixir reported this video ad was closed or not completed. Zero points credited.',
   APPLIXIR_NOT_CONFIGURED:
@@ -840,27 +842,21 @@ export async function confirmSdkAdSessionReward(params: {
     currentUser.getIdToken(),
     getAppCheckTokenHeader(),
   ]);
-  const endpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/confirmSdkAdCompletion`;
-  const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), 12_000);
 
   try {
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${idToken}`,
-        ...appCheckHeaders,
-      },
-      body: JSON.stringify(params),
-      signal: controller.signal,
-    });
+    const response = await fetchBackendEndpointWithFallback(
+      'confirmSdkAdCompletion',
+      idToken,
+      appCheckHeaders,
+      params as unknown as Record<string, unknown>,
+      12_000,
+    );
 
-    if (response.status === 404) {
+    if (!response || response.status === 404) {
       return {
         ok: false,
         error:
-          'Backend verification Cloud Function (confirmSdkAdCompletion) is not deployed yet. Deploy functions to credit verified SDK rewards.',
+          'Backend verification service (confirmSdkAdCompletion) is not configured yet. Configure Firebase Admin credentials or deploy functions to credit verified SDK rewards.',
       };
     }
 
@@ -895,8 +891,6 @@ export async function confirmSdkAdSessionReward(params: {
         ? 'Backend verification request timed out. Please tap Retry Verification.'
         : 'Unable to reach backend verification service. Zero points credited until server verification completes.',
     };
-  } finally {
-    window.clearTimeout(timeoutId);
   }
 }
 
@@ -919,6 +913,73 @@ export interface AdSessionVerificationResult {
 
 const cloudFunctionMissingCache = new Set<string>();
 const vercelApiMissingCache = new Set<string>();
+const sameOriginHealthCache = new Map<string, boolean>();
+const sameOriginHealthErrorCache = new Map<string, string>();
+
+export function clearSameOriginHealthCache(): void {
+  sameOriginHealthCache.clear();
+  sameOriginHealthErrorCache.clear();
+  vercelApiMissingCache.clear();
+}
+
+export function getLastSameOriginHealthError(): string {
+  const cacheKey = `${firebaseConfig.projectId}:${firebaseConfig.firestoreDatabaseId || '(default)'}`;
+  return sameOriginHealthErrorCache.get(cacheKey) || '';
+}
+
+async function isSameOriginApiConfigured(): Promise<boolean> {
+  if (typeof window === 'undefined') return false;
+  const cacheKey = `${firebaseConfig.projectId}:${firebaseConfig.firestoreDatabaseId || '(default)'}`;
+  const cached = sameOriginHealthCache.get(cacheKey);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), 5_000);
+  try {
+    const resp = await fetch('/api/health?probe=light', {
+      method: 'GET',
+      headers: {
+        'X-Firebase-Project-Id': firebaseConfig.projectId,
+        'X-Firestore-Database-Id': firebaseConfig.firestoreDatabaseId || '(default)',
+      },
+      signal: controller.signal,
+    });
+    const contentType = resp.headers.get('content-type') || '';
+    if (!resp.ok || !contentType.includes('application/json')) {
+      sameOriginHealthCache.set(cacheKey, false);
+      sameOriginHealthErrorCache.set(
+        cacheKey,
+        'Same-origin /api/health route is not reachable in this deployment.',
+      );
+      return false;
+    }
+    const health = (await resp.json().catch(() => null)) as {
+      firestoreAccessVerified?: boolean;
+      serverCredentialsConfigured?: boolean;
+      configurationError?: string | null;
+      reason?: string;
+    } | null;
+    const configured = Boolean(
+      health?.firestoreAccessVerified ?? health?.serverCredentialsConfigured,
+    );
+    sameOriginHealthCache.set(cacheKey, configured);
+    if (!configured) {
+      sameOriginHealthErrorCache.set(
+        cacheKey,
+        String(health?.configurationError || health?.reason || '').trim(),
+      );
+    } else {
+      sameOriginHealthErrorCache.delete(cacheKey);
+    }
+    return configured;
+  } catch {
+    return true;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
 
 function isNetworkOrUnreachableError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
@@ -952,84 +1013,93 @@ async function fetchBackendEndpointWithFallback(
   payload: Record<string, unknown>,
   timeoutMs = 10_000,
 ): Promise<Response | null> {
-  const cfKey = `${firebaseConfig.projectId}:${functionName}`;
-  if (!cloudFunctionMissingCache.has(cfKey)) {
-    const cfEndpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/${functionName}`;
-    const cfController = new AbortController();
-    const cfTimer = window.setTimeout(() => cfController.abort(), Math.min(timeoutMs, 7_000));
-    try {
-      const cfResp = await fetch(cfEndpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${idToken}`,
-          ...appCheckHeaders,
-        },
-        body: JSON.stringify(payload),
-        signal: cfController.signal,
-      });
-      if (cfResp.status === 404) {
-        const cloneText = await cfResp.clone().text().catch(() => '');
-        // Google Cloud Functions missing-route 404 returns HTML; JSON SESSION_NOT_FOUND means the function IS deployed
-        if (!cloneText.trim().startsWith('{')) {
-          cloudFunctionMissingCache.add(cfKey);
+  // Primary: Same-origin Vercel / Express Firebase Admin API (/api/<functionName>)
+  if (typeof window !== 'undefined' && !vercelApiMissingCache.has(functionName)) {
+    const apiReady = await isSameOriginApiConfigured();
+    if (!apiReady) {
+      vercelApiMissingCache.add(functionName);
+    } else {
+      const apiController = new AbortController();
+      const apiTimer = window.setTimeout(() => apiController.abort(), timeoutMs);
+      try {
+        const apiResp = await fetch(`/api/${functionName}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`,
+            'X-Firebase-Project-Id': firebaseConfig.projectId,
+            'X-Firestore-Database-Id': firebaseConfig.firestoreDatabaseId || '(default)',
+            ...appCheckHeaders,
+          },
+          body: JSON.stringify(payload),
+          signal: apiController.signal,
+        });
+        const contentType = apiResp.headers.get('content-type') || '';
+        if (apiResp.status === 404 || !contentType.includes('application/json')) {
+          if (!contentType.includes('application/json')) {
+            vercelApiMissingCache.add(functionName);
+          }
+        } else if (apiResp.status === 503) {
+          const body = (await apiResp.clone().json().catch(() => null)) as {
+            backendConfigured?: boolean;
+          } | null;
+          if (body && body.backendConfigured === false) {
+            vercelApiMissingCache.add(functionName);
+          } else {
+            return apiResp;
+          }
         } else {
-          return cfResp;
+          return apiResp;
         }
-      } else {
-        return cfResp;
+      } catch (err) {
+        if (!isNetworkOrUnreachableError(err)) {
+          throw err;
+        }
+      } finally {
+        window.clearTimeout(apiTimer);
       }
-    } catch (err) {
-      if (isNetworkOrUnreachableError(err)) {
-        // GCP 404 lacks CORS headers -> browser throws TypeError: Failed to fetch
-        cloudFunctionMissingCache.add(cfKey);
-      } else {
-        throw err;
-      }
-    } finally {
-      window.clearTimeout(cfTimer);
     }
   }
 
-  // Fallback 2: Same-origin Vercel / Node serverless API (/api/<functionName>)
-  if (typeof window !== 'undefined' && !vercelApiMissingCache.has(functionName)) {
-    const apiController = new AbortController();
-    const apiTimer = window.setTimeout(() => apiController.abort(), timeoutMs);
-    try {
-      const apiResp = await fetch(`/api/${functionName}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${idToken}`,
-          'X-Firebase-Project-Id': firebaseConfig.projectId,
-          'X-Firestore-Database-Id': firebaseConfig.firestoreDatabaseId || '(default)',
-          ...appCheckHeaders,
-        },
-        body: JSON.stringify(payload),
-        signal: apiController.signal,
-      });
-      const contentType = apiResp.headers.get('content-type') || '';
-      if (!contentType.includes('application/json')) {
-        vercelApiMissingCache.add(functionName);
-        return null;
-      }
-      if (apiResp.status === 503) {
-        const body = (await apiResp.clone().json().catch(() => null)) as {
-          backendConfigured?: boolean;
-        } | null;
-        if (body && body.backendConfigured === false) {
-          vercelApiMissingCache.add(functionName);
-          return null;
+  // Fallback: Deployed Firebase Cloud Function (only when explicitly enabled on Blaze project)
+  if (import.meta.env.VITE_ENABLE_CLOUD_FUNCTIONS_FALLBACK === 'true') {
+    const cfKey = `${firebaseConfig.projectId}:${functionName}`;
+    if (!cloudFunctionMissingCache.has(cfKey)) {
+      const cfEndpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/${functionName}`;
+      const cfController = new AbortController();
+      const cfTimer = window.setTimeout(() => cfController.abort(), Math.min(timeoutMs, 7_000));
+      try {
+        const cfResp = await fetch(cfEndpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`,
+            ...appCheckHeaders,
+          },
+          body: JSON.stringify(payload),
+          signal: cfController.signal,
+        });
+        if (cfResp.status === 404) {
+          const cloneText = await cfResp.clone().text().catch(() => '');
+          // Google Cloud Functions missing-route 404 returns HTML; JSON SESSION_NOT_FOUND means the function IS deployed
+          if (!cloneText.trim().startsWith('{')) {
+            cloudFunctionMissingCache.add(cfKey);
+          } else {
+            return cfResp;
+          }
+        } else {
+          return cfResp;
         }
+      } catch (err) {
+        if (isNetworkOrUnreachableError(err)) {
+          // GCP 404 lacks CORS headers -> browser throws TypeError: Failed to fetch
+          cloudFunctionMissingCache.add(cfKey);
+        } else {
+          throw err;
+        }
+      } finally {
+        window.clearTimeout(cfTimer);
       }
-      return apiResp;
-    } catch (err) {
-      if (isNetworkOrUnreachableError(err)) {
-        return null;
-      }
-      throw err;
-    } finally {
-      window.clearTimeout(apiTimer);
     }
   }
 
@@ -1037,14 +1107,17 @@ async function fetchBackendEndpointWithFallback(
 }
 
 /**
- * Admin-authorized atomic Firestore transaction fallback when neither Cloud Functions
- * nor Vercel Service Account credentials are configured yet.
- * Enforces >=30s server-clock elapsed check, non-AppLixir gate, daily limits, and Firestore Rules `isAdmin()`.
+ * Atomic Firestore 30-second reward crediting transaction.
+ * Enforces >=30s server-clock elapsed check (via Firestore Rules request.time),
+ * exact ad/bonus reward matching, daily limits, and idempotency.
  */
 async function verifyAndCreditAdRewardViaAdminFirestore(
   sessionId: string,
   uid: string,
 ): Promise<AdSessionVerificationResult> {
+  let requiredDurationSec = MIN_AD_VIEW_SECONDS;
+  let elapsedSec = 0;
+
   try {
     const sessionRef = doc(db, 'adSessions', sessionId);
     const sessionSnap = await getDocFromServer(sessionRef);
@@ -1090,9 +1163,17 @@ async function verifyAndCreditAdRewardViaAdminFirestore(
 
     const adId = String(sessionData.adId || '');
     const isDailyBonus = adId === DAILY_CHECKIN_BONUS_AD_ID;
-    const adOrBonusSnap = await getDocFromServer(
+    let usingDirectLinkCollection = false;
+    let adOrBonusSnap = await getDocFromServer(
       isDailyBonus ? doc(db, 'appSettings', 'dailyBonus') : doc(db, 'advertisements', adId),
     );
+    if (!isDailyBonus && !adOrBonusSnap.exists()) {
+      const dlSnap = await getDocFromServer(doc(db, 'directLinkAds', adId)).catch(() => null);
+      if (dlSnap && dlSnap.exists()) {
+        adOrBonusSnap = dlSnap;
+        usingDirectLinkCollection = true;
+      }
+    }
     if (!adOrBonusSnap.exists()) {
       return {
         ok: false,
@@ -1110,7 +1191,7 @@ async function verifyAndCreditAdRewardViaAdminFirestore(
       : String(adOrBonusData.adNetwork || sessionData.adNetwork || 'Monetag');
     const placementVal = isDailyBonus
       ? String(adOrBonusData.monetagDirectLinkUrl || '')
-      : String(adOrBonusData.placementOrUrl || '');
+      : String(adOrBonusData.placementOrUrl || adOrBonusData.url || '');
     const isAppLixir =
       adNetworkName.toLowerCase().includes('applixir') || /^applixir:/i.test(placementVal.trim());
     if (isAppLixir) {
@@ -1122,13 +1203,13 @@ async function verifyAndCreditAdRewardViaAdminFirestore(
       };
     }
 
-    const requiredDurationSec = normalizeAdDurationSeconds(
+    requiredDurationSec = normalizeAdDurationSeconds(
       isDailyBonus ? adOrBonusData.durationSeconds : adOrBonusData.estimatedDuration,
     );
     const createdAtTs = sessionData.createdAt;
     const createdAtMillis =
       createdAtTs instanceof Timestamp ? createdAtTs.toDate().getTime() : 0;
-    const elapsedSec = createdAtMillis > 0 ? (Date.now() - createdAtMillis) / 1000 : 0;
+    elapsedSec = createdAtMillis > 0 ? (Date.now() - createdAtMillis) / 1000 : 0;
 
     if (elapsedSec < requiredDurationSec) {
       return {
@@ -1139,9 +1220,10 @@ async function verifyAndCreditAdRewardViaAdminFirestore(
     }
 
     const dhakaToday = getDhakaDateKey();
-    const providerTxId = `timer_${sessionId}`.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 110);
+    const cleanSessionId = sessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const providerTxId = `timer_${cleanSessionId}`.slice(0, 96);
     const completionId = `comp_${providerTxId}`.slice(0, 120);
-    const txId = `tx_${providerTxId}`.slice(0, 120);
+    const txId = `tx_${providerTxId}`.slice(0, 105);
     const ledgerId = `led_${txId}`.slice(0, 120);
 
     const completionRef = doc(db, 'adCompletions', completionId);
@@ -1153,16 +1235,9 @@ async function verifyAndCreditAdRewardViaAdminFirestore(
     const dailyBonusUserRef = doc(db, 'dailyBonuses', uid);
     const walletSettingsRef = doc(db, 'appSettings', 'wallet');
     const economyRef = doc(db, 'appConfig', 'economy');
-
-    let todayDailyLimitExists = false;
-    if (!isDailyBonus) {
-      const existingLimitsSnap = await getDocsFromServer(
-        query(collection(db, 'dailyAdLimits'), where('userId', '==', uid)),
-      ).catch(() => null);
-      todayDailyLimitExists = Boolean(
-        existingLimitsSnap?.docs.some((d) => d.id === `${uid}_${dhakaToday}`),
-      );
-    }
+    const adSourceRef = isDailyBonus
+      ? doc(db, 'appSettings', 'dailyBonus')
+      : doc(db, usingDirectLinkCollection ? 'directLinkAds' : 'advertisements', adId);
 
     const outcome = await runTransaction(db, async (txn) => {
       const [
@@ -1177,12 +1252,8 @@ async function verifyAndCreditAdRewardViaAdminFirestore(
         txn.get(sessionRef),
         txn.get(userRef),
         txn.get(walletRef),
-        txn.get(isDailyBonus ? doc(db, 'appSettings', 'dailyBonus') : doc(db, 'advertisements', adId)),
-        isDailyBonus
-          ? txn.get(dailyBonusUserRef)
-          : todayDailyLimitExists
-            ? txn.get(dailyLimitRef)
-            : Promise.resolve(null),
+        txn.get(adSourceRef),
+        isDailyBonus ? txn.get(dailyBonusUserRef) : txn.get(dailyLimitRef),
         txn.get(walletSettingsRef),
         txn.get(economyRef),
       ]);
@@ -1249,7 +1320,10 @@ async function verifyAndCreditAdRewardViaAdminFirestore(
         if (adData.rewardVerificationMethod === 'none') {
           throw new Error('AD_VERIFICATION_DISABLED');
         }
-        if (adData.adType === 'direct_link' && adData.incentivizedTrafficAllowed !== true) {
+        if (
+          (usingDirectLinkCollection || adData.adType === 'direct_link') &&
+          adData.incentivizedTrafficAllowed !== true
+        ) {
           throw new Error('INCENTIVIZED_TRAFFIC_DISALLOWED');
         }
 
@@ -1270,8 +1344,8 @@ async function verifyAndCreditAdRewardViaAdminFirestore(
         }
         rewardPoints = Math.max(0, Number(adData.rewardPoints || 0));
         if (rewardPoints <= 0) throw new Error('INVALID_REWARD_AMOUNT');
-        adName = String(adData.adName || 'Advertisement');
-        adNetwork = String(adData.adNetwork || 'Partner Network');
+        adName = String(adData.adName || adData.title || 'Advertisement').slice(0, 100);
+        adNetwork = String(adData.adNetwork || 'Partner Network').slice(0, 60);
       }
 
       const w = walletSnap.exists() ? walletSnap.data() : {};
@@ -1317,30 +1391,22 @@ async function verifyAndCreditAdRewardViaAdminFirestore(
       });
 
       if (isDailyBonus) {
-        txn.set(
-          dailyBonusUserRef,
-          {
-            uid,
-            streakDays: nextStreakDays,
-            lastClaimDate: dhakaToday,
-            lastClaimPoints: rewardPoints,
-            updatedAt: nowServer,
-          },
-          { merge: true },
-        );
+        txn.set(dailyBonusUserRef, {
+          uid,
+          streakDays: nextStreakDays,
+          lastClaimDate: dhakaToday,
+          lastClaimPoints: rewardPoints,
+          updatedAt: nowServer,
+        });
       } else {
-        txn.set(
-          dailyLimitRef,
-          {
-            userId: uid,
-            dhakaDate: dhakaToday,
-            completedCount: currentCount + 1,
-            earnedPoints: currentEarned + rewardPoints,
-            completedAdIds: [...completedAdIds, adId],
-            updatedAt: nowServer,
-          },
-          { merge: true },
-        );
+        txn.set(dailyLimitRef, {
+          userId: uid,
+          dhakaDate: dhakaToday,
+          completedCount: currentCount + 1,
+          earnedPoints: currentEarned + rewardPoints,
+          completedAdIds: [...completedAdIds, adId],
+          updatedAt: nowServer,
+        });
       }
 
       txn.set(txRef, {
@@ -1386,6 +1452,7 @@ async function verifyAndCreditAdRewardViaAdminFirestore(
         totalEarnedPoints: prevTotalEarned + rewardPoints,
         totalWithdrawnPoints: prevWithdrawnPts,
         totalWithdrawnBdt: prevWithdrawnBdt,
+        lastTransactionId: txId,
         updatedAt: nowServer,
       });
 
@@ -1417,12 +1484,20 @@ async function verifyAndCreditAdRewardViaAdminFirestore(
       code.includes('Missing or insufficient permissions') ||
       code.includes('permission-denied')
     ) {
+      // Handle minor client/server clock skew right around the 30-second boundary cleanly
+      if (elapsedSec < requiredDurationSec + 4) {
+        return {
+          ok: true,
+          status: 'awaiting_timer',
+          remainingSec: 1,
+        };
+      }
       return {
         ok: false,
-        status: 'backend_unavailable',
+        status: 'rejected',
         error:
-          'Reward verification backend is not configured yet for member accounts. Deploy Firebase Cloud Functions or add FIREBASE_SERVICE_ACCOUNT_JSON in Vercel Environment Variables so customer rewards credit automatically.',
-        retryable: false,
+          'Could not credit reward automatically due to Firestore permission checks. Make sure your email is verified and the updated firestore.rules are published to Firebase.',
+        retryable: true,
       };
     }
     if (code === 'DUPLICATE_PROVIDER_TX' || code === 'SESSION_ALREADY_FINALIZED') {
@@ -2143,6 +2218,12 @@ export async function submitSecureWithdrawalRequest(payload: {
   if (!currentUser) {
     throw new Error('Authentication required before submitting a withdrawal request.');
   }
+  if (import.meta.env.VITE_ENABLE_CLOUD_FUNCTIONS_FALLBACK !== 'true') {
+    throw new Error(
+      'Withdrawal backend Cloud Function is not enabled yet. Deploy Firebase Cloud Functions (`firebase deploy --only functions`) on a Blaze project and set VITE_ENABLE_CLOUD_FUNCTIONS_FALLBACK=true.',
+    );
+  }
+
   const idToken = await currentUser.getIdToken();
   const appCheckHeaders = await getAppCheckTokenHeader();
   const requestId = `wd_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
@@ -2208,6 +2289,11 @@ export async function cancelPendingWithdrawalRequest(requestId: string): Promise
   const currentUser = auth.currentUser;
   if (!currentUser) {
     throw new Error('Authentication required.');
+  }
+  if (import.meta.env.VITE_ENABLE_CLOUD_FUNCTIONS_FALLBACK !== 'true') {
+    throw new Error(
+      'Cancellation backend Cloud Function is not enabled yet. Deploy Firebase Cloud Functions (`firebase deploy --only functions`) and set VITE_ENABLE_CLOUD_FUNCTIONS_FALLBACK=true.',
+    );
   }
   const idToken = await currentUser.getIdToken();
   const appCheckHeaders = await getAppCheckTokenHeader();
@@ -2382,43 +2468,45 @@ export async function adminUpdateWithdrawalStatus(params: {
     throw new Error('Please provide a clear rejection reason.');
   }
 
-  try {
-    const [idToken, appCheckHeaders] = await Promise.all([
-      currentUser.getIdToken(),
-      getAppCheckTokenHeader(),
-    ]);
-    const endpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/adminManageWithdrawal`;
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${idToken}`,
-        ...appCheckHeaders,
-      },
-      body: JSON.stringify({
-        requestId,
-        action,
-        payoutTransactionId: payoutTransactionId.trim(),
-        rejectionReason: rejectionReason.trim(),
-      }),
-    });
-    if (response.ok) {
-      const body = (await response.json()) as { ok?: boolean; error?: string };
-      if (body.ok) return;
-      throw new Error(body.error || 'Admin action rejected.');
-    }
-    if (response.status >= 400 && response.status < 500 && response.status !== 404) {
-      const body = (await response.json().catch(() => ({}))) as { error?: string };
-      throw new Error(body.error || 'Admin action rejected.');
-    }
-  } catch (err) {
-    if (
-      err instanceof Error &&
-      !err.message.includes('Failed to fetch') &&
-      !err.message.includes('NetworkError') &&
-      !err.message.includes('Load failed')
-    ) {
-      throw err;
+  if (import.meta.env.VITE_ENABLE_CLOUD_FUNCTIONS_FALLBACK === 'true') {
+    try {
+      const [idToken, appCheckHeaders] = await Promise.all([
+        currentUser.getIdToken(),
+        getAppCheckTokenHeader(),
+      ]);
+      const endpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/adminManageWithdrawal`;
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+          ...appCheckHeaders,
+        },
+        body: JSON.stringify({
+          requestId,
+          action,
+          payoutTransactionId: payoutTransactionId.trim(),
+          rejectionReason: rejectionReason.trim(),
+        }),
+      });
+      if (response.ok) {
+        const body = (await response.json()) as { ok?: boolean; error?: string };
+        if (body.ok) return;
+        throw new Error(body.error || 'Admin action rejected.');
+      }
+      if (response.status >= 400 && response.status < 500 && response.status !== 404) {
+        const body = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new Error(body.error || 'Admin action rejected.');
+      }
+    } catch (err) {
+      if (
+        err instanceof Error &&
+        !err.message.includes('Failed to fetch') &&
+        !err.message.includes('NetworkError') &&
+        !err.message.includes('Load failed')
+      ) {
+        throw err;
+      }
     }
   }
 
@@ -2784,37 +2872,29 @@ export async function saveDailyBonusAdConfig(
       currentUser.getIdToken(),
       getAppCheckTokenHeader(),
     ]);
-    const endpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/updateDailyBonusAdSettings`;
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${idToken}`,
-        ...appCheckHeaders,
-      },
-      body: JSON.stringify({
+    const response = await fetchBackendEndpointWithFallback(
+      'updateDailyBonusAdSettings',
+      idToken,
+      appCheckHeaders,
+      {
         enabled,
         monetagDirectLinkUrl: cleanUrl,
         rewardPoints: cleanReward,
         durationSeconds: cleanDuration,
         incentivizedTrafficAllowed: incentivized,
-      }),
-    });
+      },
+      10_000,
+    );
 
-    if (response.ok) {
+    if (response && response.ok) {
       return { usedCloudFunction: true };
     }
-    if (response.status !== 404) {
+    if (response && response.status !== 404 && response.status !== 503) {
       const body = (await response.json().catch(() => ({}))) as { error?: string };
       throw new Error(body.error || 'Could not update Daily Check-in Bonus settings.');
     }
   } catch (err) {
-    if (
-      err instanceof Error &&
-      !err.message.includes('Failed to fetch') &&
-      !err.message.includes('NetworkError') &&
-      !err.message.includes('Load failed')
-    ) {
+    if (!isNetworkOrUnreachableError(err)) {
       throw err;
     }
   }
@@ -3095,7 +3175,7 @@ export async function initiateDailyBonusAdSession(user: UserProfile): Promise<{
     const msg = err instanceof Error ? err.message : '';
     if (msg.includes('permission-denied') || msg.includes('Missing or insufficient permissions')) {
       throw new Error(
-        'Please ask Admin to re-save the Claim Bonus Monetag link once in Admin Panel (or deploy Cloud Functions) so Daily Bonus sessions can start.',
+        'Could not start Daily Bonus session due to Firestore rules permissions. Please ensure your email is verified and the updated firestore.rules are published.',
       );
     }
     throw err;
@@ -3398,6 +3478,11 @@ export async function requestReferralQualificationCheck(referredUid?: string): P
   if (!currentUser) {
     throw new Error('Authentication required.');
   }
+  if (import.meta.env.VITE_ENABLE_CLOUD_FUNCTIONS_FALLBACK !== 'true') {
+    throw new Error(
+      'Referral verification Cloud Function is not enabled yet. Deploy Firebase Cloud Functions (`firebase deploy --only functions`) and set VITE_ENABLE_CLOUD_FUNCTIONS_FALLBACK=true.',
+    );
+  }
   const [idToken, appCheckHeaders] = await Promise.all([
     currentUser.getIdToken(),
     getAppCheckTokenHeader(),
@@ -3522,39 +3607,41 @@ export async function adminManageReferral(payload: {
   if (!currentUser) {
     throw new Error('Admin authentication required.');
   }
-  const [idToken, appCheckHeaders] = await Promise.all([
-    currentUser.getIdToken(),
-    getAppCheckTokenHeader(),
-  ]);
-  const endpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/adminManageReferral`;
+  if (import.meta.env.VITE_ENABLE_CLOUD_FUNCTIONS_FALLBACK === 'true') {
+    const [idToken, appCheckHeaders] = await Promise.all([
+      currentUser.getIdToken(),
+      getAppCheckTokenHeader(),
+    ]);
+    const endpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/adminManageReferral`;
 
-  try {
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${idToken}`,
-        ...appCheckHeaders,
-      },
-      body: JSON.stringify({
-        referredUid,
-        action,
-        rejectionReason: rejectionReason.trim(),
-      }),
-    });
-    if (response.ok) return;
-    if (response.status !== 404) {
-      const body = (await response.json().catch(() => ({}))) as { error?: string };
-      throw new Error(body.error || 'Admin referral action rejected.');
-    }
-  } catch (err) {
-    if (
-      err instanceof Error &&
-      !err.message.includes('Failed to fetch') &&
-      !err.message.includes('NetworkError') &&
-      !err.message.includes('Load failed')
-    ) {
-      throw err;
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+          ...appCheckHeaders,
+        },
+        body: JSON.stringify({
+          referredUid,
+          action,
+          rejectionReason: rejectionReason.trim(),
+        }),
+      });
+      if (response.ok) return;
+      if (response.status !== 404) {
+        const body = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new Error(body.error || 'Admin referral action rejected.');
+      }
+    } catch (err) {
+      if (
+        err instanceof Error &&
+        !err.message.includes('Failed to fetch') &&
+        !err.message.includes('NetworkError') &&
+        !err.message.includes('Load failed')
+      ) {
+        throw err;
+      }
     }
   }
 

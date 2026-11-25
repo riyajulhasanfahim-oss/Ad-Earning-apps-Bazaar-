@@ -339,11 +339,14 @@ export async function processVerifiedNetworkCallback(
     return { httpStatus: 403, body: { ok: false, error: 'APPLIXIR_STATUS_NOT_COMPLETED' } };
   }
 
-  // 0b. Monetag reward_event_type check (never reward not_valued events)
+  // 0b. Monetag official reward_event_type check (only 'valued' may credit; reject 'non_valued')
   const monetagEventLower = (ctx.monetagParams?.rewardEventType || '').trim().toLowerCase();
   if (
     monetagEventLower &&
-    ['not_valued', 'not-valued', 'rejected', 'failed', '0', 'false'].includes(monetagEventLower)
+    (monetagEventLower !== 'valued' ||
+      ['non_valued', 'non-valued', 'not_valued', 'not-valued', 'rejected', 'failed', '0', 'false'].includes(
+        monetagEventLower,
+      ))
   ) {
     const failId = sanitizeId(`cb_rej_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
     await Promise.all([
@@ -359,19 +362,19 @@ export async function processVerifiedNetworkCallback(
         timestampValid: true,
         replayDetected: false,
         rewardPoints: 0,
-        rejectionReason: 'MONETAG_EVENT_NOT_VALUED',
+        rejectionReason: 'MONETAG_EVENT_NON_VALUED',
         callbackTimestampSec: parseCallbackTimestampSec(ctx.rawTimestamp) ?? 0,
         createdAt: FieldValue.serverTimestamp(),
       }),
       writeAdNetworkLog({
         networkId: analyticsNetId,
-        eventType: 'callback_monetag_not_valued',
+        eventType: 'callback_monetag_non_valued',
         severity: 'warning',
         status: 'rejected',
         details: `Rejected Monetag callback reward_event_type="${monetagEventLower}" for session=${ctx.sessionId}`,
       }),
     ]);
-    return { httpStatus: 403, body: { ok: false, error: 'MONETAG_EVENT_NOT_VALUED' } };
+    return { httpStatus: 403, body: { ok: false, error: 'MONETAG_EVENT_NON_VALUED' } };
   }
 
   // 1. Validate Signature / Secret

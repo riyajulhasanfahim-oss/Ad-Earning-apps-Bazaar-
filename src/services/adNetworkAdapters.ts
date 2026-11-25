@@ -60,14 +60,14 @@ function buildResolvedPlacementUrl(
   try {
     const resolved = trimmed
       .replace(/\{sessionId\}|\{session_id\}|\{ymid\}/gi, encodeURIComponent(session.sessionId))
-      .replace(/\{userId\}|\{user_id\}|\{subid\}/gi, encodeURIComponent(session.userId))
+      .replace(/\{userId\}|\{user_id\}|\{var\}|\{request_var\}/gi, encodeURIComponent(session.userId))
       .replace(/\{adId\}|\{ad_id\}/gi, encodeURIComponent(session.adId));
     const url = new URL(resolved);
-    if (!url.searchParams.has('ymid') && !url.searchParams.has('session_id')) {
-      url.searchParams.set('session_id', session.sessionId);
+    if (!url.searchParams.has('ymid')) {
+      url.searchParams.set('ymid', session.sessionId);
     }
-    if (!url.searchParams.has('subid')) {
-      url.searchParams.set('subid', session.userId);
+    if (!url.searchParams.has('var')) {
+      url.searchParams.set('var', session.userId);
     }
     return url.toString();
   } catch {
@@ -84,7 +84,7 @@ export class MonetagAdAdapter implements RewardedNetworkAdapter {
     supportsClicksReporting: false,
     supportsApiHealthCheck: false,
     incentivizedPolicySummary:
-      'Supports Monetag Rewarded SDK & S2S postbacks (ymid / subid / tx_id) for explicitly approved rewarded placements.',
+      'Supports Monetag Rewarded SDK & S2S postbacks (ymid / reward_event_type / zone_id) for explicitly approved rewarded placements.',
   };
 
   async initialize(config: Partial<AdNetworkConfig>): Promise<AdapterInitResult> {

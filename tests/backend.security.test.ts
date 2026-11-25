@@ -140,20 +140,50 @@ function runAllBackendSecurityTests(): void {
   }
   results.push(`Test 2 PASSED: Zero blanket public reads across all ${privateCollections.length} sensitive collections`);
 
-  // Test 3: Wallet Balance & Financial Immutability from Clients
-  for (const serverOnlyCol of ['wallets', 'walletLedger', 'withdrawalRequests', 'transactions', 'adCompletions', 'dailyAdLimits', 'referralRewards']) {
-    const block = extractCollectionBlock(serverOnlyCol);
+  // Test 3: Wallet Balance & Financial Immutability from Clients (Strict Admin-Only Withdrawals + >=30s Server-Clock Atomic Reward Credits)
+  for (const adminOnlyCol of ['withdrawalRequests', 'referralRewards']) {
+    const block = extractCollectionBlock(adminOnlyCol);
     assert.match(
       block,
       /allow create, update, delete:\s*if isValidId\([^)]+\) && isAdmin\(\);/,
-      `/${serverOnlyCol} must restrict client writes strictly to Admin/Server SDK`,
+      `/${adminOnlyCol} must restrict client writes strictly to Admin/Server SDK`,
     );
   }
+  for (const atomicRewardCol of ['wallets', 'walletLedger', 'transactions', 'adCompletions', 'dailyAdLimits', 'dailyBonuses']) {
+    const block = extractCollectionBlock(atomicRewardCol);
+    assert.match(block, /isAdmin\(\)/, `/${atomicRewardCol} must allow Admin access`);
+    assert.match(block, /isEmailVerified\(\)/, `/${atomicRewardCol} must enforce verified email for atomic credits`);
+    if (atomicRewardCol === 'dailyBonuses') {
+      assert.match(block, /allow delete:\s*if isValidId\([^)]+\) && isAdmin\(\);/, '/dailyBonuses delete must be Admin-only');
+    } else if (atomicRewardCol === 'walletLedger' || atomicRewardCol === 'transactions' || atomicRewardCol === 'adCompletions') {
+      assert.match(block, /allow update, delete:\s*if isValidId\([^)]+\) && isAdmin\(\);/, `/${atomicRewardCol} update/delete must be Admin-only`);
+    } else {
+      assert.match(block, /allow delete:\s*if isValidId\([^)]+\) && isAdmin\(\);/, `/${atomicRewardCol} delete must be Admin-only`);
+    }
+  }
+  const walletsBlock = extractCollectionBlock('wallets');
+  assert.match(walletsBlock, /isValidWallet\(incoming\(\)\)/);
+  assert.match(walletsBlock, /isValidTimerTxId\(incoming\(\)\.lastTransactionId\)/);
+  assert.match(walletsBlock, /getAfter\(\/databases\/\$\(database\)\/documents\/adCompletions\//);
+  const walletLedgerBlock = extractCollectionBlock('walletLedger');
+  assert.match(walletLedgerBlock, /isValidWalletLedgerEntry\(incoming\(\)\)/);
+  assert.match(walletLedgerBlock, /isValidTimerTxId\(incoming\(\)\.transactionId\)/);
+  const transactionsBlock = extractCollectionBlock('transactions');
+  assert.match(transactionsBlock, /isValidTransaction\(incoming\(\)\)/);
+  assert.match(transactionsBlock, /isValidTimerTxId\(txId\)/);
+  const adCompletionsBlock = extractCollectionBlock('adCompletions');
+  assert.match(adCompletionsBlock, /isValidAdCompletion\(incoming\(\)\)/);
+  assert.match(adCompletionsBlock, /duration\.value\(30, 's'\)/);
+  const dailyAdLimitsBlock = extractCollectionBlock('dailyAdLimits');
+  assert.match(dailyAdLimitsBlock, /isValidDailyAdLimit\(incoming\(\)\)/);
+  const dailyBonusesBlock = extractCollectionBlock('dailyBonuses');
+  assert.match(dailyBonusesBlock, /isValidDailyBonusState\(incoming\(\)\)/);
   const usersBlock = extractCollectionBlock('users');
   assert.match(usersBlock, /incoming\(\)\.points == existing\(\)\.points/);
   assert.match(usersBlock, /incoming\(\)\.totalEarnings == existing\(\)\.totalEarnings/);
   assert.match(usersBlock, /incoming\(\)\.totalAdViews == existing\(\)\.totalAdViews/);
-  results.push('Test 3 PASSED: Balance manipulation and fake transaction creation blocked in rules');
+  assert.match(usersBlock, /getAfter\(\/databases\/\$\(database\)\/documents\/wallets\/\$\(userId\)\)\.data\.availablePoints/);
+  results.push('Test 3 PASSED: Arbitrary balance manipulation blocked & >=30s server-clock atomic reward ledger checks verified in rules');
 
   // Test 4: Immutable Monitoring & Audit Logs
   for (const immutableCol of ['adminLogs', 'referralLogs', 'failedTransactionLogs', 'reconciliationReports', 'systemErrors']) {
@@ -471,7 +501,11 @@ function runAllBackendSecurityTests(): void {
   const adSessionsBlock = extractCollectionBlock('adSessions');
   assert.match(adSessionsBlock, /incoming\(\)\.status == 'rejected'/);
   assert.match(adSessionsBlock, /incoming\(\)\.transactionId == ''/);
-  results.push('Test 19 PASSED: 30s backend duration, 3000s guard, TMA-only Monetag guard, direct-link SDK block & owner-reject-only adSessions rules verified');
+  assert.match(adSessionsBlock, /incoming\(\)\.status == 'completed'/);
+  assert.match(adSessionsBlock, /request\.time >= existing\(\)\.createdAt \+ duration\.value\(30, 's'\)/);
+  assert.match(adSessionsBlock, /existsAfter\(\/databases\/\$\(database\)\/documents\/wallets\/\$\(request\.auth\.uid\)\)/);
+  assert.match(adSessionsBlock, /existsAfter\(\/databases\/\$\(database\)\/documents\/adCompletions\//);
+  results.push('Test 19 PASSED: 30s server-clock duration, TMA-only Monetag guard, direct-link SDK block & atomic adSessions completion/rejection rules verified');
 
   // Test 20: AppLixir Web Rewarded Video MD5+TID S2S Verification & Zero Client Fallback
   const verifyAppLixirMd5Local = (params: {
@@ -589,7 +623,7 @@ function runAllBackendSecurityTests(): void {
   // Test 21: Monetag Daily Check-in Bonus Direct Link S2S Verification, Once-Per-Day Cap & Rules Enforcement
   assert.match(FUNCTIONS_HELPERS, /DAILY_CHECKIN_BONUS_AD_ID = 'daily_checkin_bonus'/);
   assert.match(FUNCTIONS_HELPERS, /export function getDhakaYesterdayDateKey/);
-  assert.match(FUNCTIONS_AD_NETWORK, /MONETAG_EVENT_NOT_VALUED/);
+  assert.match(FUNCTIONS_AD_NETWORK, /MONETAG_EVENT_NON_VALUED/);
   assert.match(FUNCTIONS_AD_NETWORK, /DAILY_BONUS_ALREADY_CLAIMED/);
   assert.match(FUNCTIONS_INDEX, /USE_DAILY_BONUS_ENDPOINT/);
   assert.match(FUNCTIONS_INDEX, /DAILY_BONUS_ALREADY_CLAIMED/);
@@ -598,9 +632,9 @@ function runAllBackendSecurityTests(): void {
   assert.match(appSettingsBlock, /settingId == 'dailyBonus'/);
   assert.match(RULES_TEXT, /data\.incentivizedTrafficAllowed == true/);
   assert.match(RULES_TEXT, /data\.durationSeconds >= 30 && data\.durationSeconds <= 180/);
-  results.push('Test 21 PASSED: Monetag Daily Check-in Bonus S2S verification, once-per-day cap, valued-event & rules guards verified');
+  results.push('Test 21 PASSED: Monetag Daily Check-in Bonus S2S verification, once-per-day cap, non_valued rejection & rules guards verified');
 
-  // Test 22: Bounded Reward Verification Polling, Early S2S Callback Holding (<30s) & Macro Sanitization
+  // Test 22: Bounded Reward Verification Polling, Early S2S Callback Holding (<30s) & Official Monetag Macro Sanitization
   assert.match(FUNCTIONS_INDEX, /export const verifyAdSessionReward = onRequest/);
   assert.match(FUNCTIONS_INDEX, /const stripMacro = /);
   assert.match(FUNCTIONS_INDEX, /netLower\.includes\('monetag'\)/);
@@ -631,7 +665,13 @@ function runAllBackendSecurityTests(): void {
   );
   assert.match(adminModalSrc, /verifyAdNetworkCallback\?net=monetag/);
   assert.match(adminModalSrc, /session_id=\{ymid\}/);
-  results.push('Test 22 PASSED: Bounded verification polling, early S2S awaiting_duration holding, Retry UI & Monetag macro sanitization verified');
+  assert.ok(!/\{subid\}|\{click_id\}/.test(adminModalSrc), 'Unsupported {subid} or {click_id} macros must be removed from AdminAdManagerModal');
+  const adNetSvcSrc = fs.readFileSync(
+    path.join(ROOT, 'src', 'services', 'adNetworkService.ts'),
+    'utf8',
+  );
+  assert.ok(!/\{subid\}|\{click_id\}/.test(adNetSvcSrc), 'Unsupported {subid} or {click_id} macros must be removed from adNetworkService');
+  results.push('Test 22 PASSED: Bounded verification polling, early S2S awaiting_duration holding, Retry UI & official Monetag macro sanitization verified');
 
   // Test 23: Multi Direct Link Ads Management (10 uplcm URLs, genuine-click-only, S2S reward policy gate & Rules)
   const directLinksServiceSrc = fs.readFileSync(
@@ -669,6 +709,22 @@ function runAllBackendSecurityTests(): void {
     'DirectLinkAdsPlacement must open links strictly via genuine user click, never auto-open/popunder',
   );
   results.push('Test 23 PASSED: Multi Direct Link Ads 10 uplcm URLs, Rules validation & genuine-click enforcement verified');
+
+  // Test 24: Firebase Admin Service Account Diagnostics, 5-Point Health Check & Zero Unconfigured CORS Calls
+  const firebaseAdminTs = fs.readFileSync(path.join(ROOT, 'api', '_firebaseAdmin.ts'), 'utf8');
+  const healthTs = fs.readFileSync(path.join(ROOT, 'api', 'health.ts'), 'utf8');
+  const authSvcSrc = fs.readFileSync(path.join(ROOT, 'src', 'services', 'authService.ts'), 'utf8');
+  assert.match(firebaseAdminTs, /inspectServiceAccountEnv/);
+  assert.match(firebaseAdminTs, /SERVICE_ACCOUNT_PROJECT_MISMATCH/);
+  assert.match(firebaseAdminTs, /detectRuntimeEnvironment/);
+  assert.match(healthTs, /firebaseAdminInitialized/);
+  assert.match(healthTs, /firestoreConnected/);
+  assert.match(healthTs, /firestoreWritePermission/);
+  assert.match(healthTs, /monetagPostbackConfigured/);
+  assert.match(healthTs, /rewardVerificationApiWorking/);
+  assert.match(authSvcSrc, /VITE_ENABLE_CLOUD_FUNCTIONS_FALLBACK/);
+  assert.match(dashboardSrc, /VITE_ENABLE_CLOUD_FUNCTIONS_FALLBACK/);
+  results.push('Test 24 PASSED: Firebase Admin diagnostics, 5-point Health Check & CORS-safe Cloud Function gating verified');
 
   for (const line of results) {
     console.log(line);

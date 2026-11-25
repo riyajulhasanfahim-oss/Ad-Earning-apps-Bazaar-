@@ -991,16 +991,16 @@ async function handleVerifiedPostbackOrSdkCompletion(req: Request, res: HttpsRes
   }
 
   const rawSessionToken = stripMacro(
-    source.sessionId ||
+    source.ymid ||
+      source.sessionId ||
       source.session_id ||
-      source.ymid ||
       source.request_var ||
       customDataSessionId ||
       source.custom1,
   );
   const sessionId = rawSessionToken ? sanitizeId(rawSessionToken).replace(/^id_\d+$/, '') : '';
   const rawUserId = stripMacro(
-    source.userId || source.user_id || source.userid || source.subid,
+    source.userId || source.user_id || source.userid || source.var,
   );
   let userId = rawUserId;
   let adId = stripMacro(source.adId || source.ad_id || customDataAdId || source.custom2);
@@ -1032,8 +1032,6 @@ async function handleVerifiedPostbackOrSdkCompletion(req: Request, res: HttpsRes
       source.provider_tx_id ||
       source.tx_id ||
       source.transaction_id ||
-      source.click_id ||
-      source.clickid ||
       source.conversion_id ||
       source.request_id ||
       tid,
@@ -1043,27 +1041,33 @@ async function handleVerifiedPostbackOrSdkCompletion(req: Request, res: HttpsRes
   const providedSecret = stripMacro(req.headers['x-postback-secret'] || source.secret);
   const providedSignature = stripMacro(req.headers['x-postback-signature'] || source.sig);
 
-  // Hydrate adId, userId, and networkId when omitted from server-created adSessions/{sessionId}
-  if (sessionId && (!adId || !userId || !networkId)) {
-    try {
-      const sessSnap = await db.collection('adSessions').doc(sessionId).get();
-      if (sessSnap.exists) {
-        const sess = sessSnap.data()!;
-        if (!adId && typeof sess.adId === 'string') {
-          adId = String(sess.adId).trim();
-        }
-        if (!userId && typeof sess.userId === 'string') {
-          userId = String(sess.userId).trim();
-        }
-        if (!networkId && typeof sess.adNetwork === 'string') {
-          const netLower = String(sess.adNetwork).toLowerCase();
-          if (netLower.includes('monetag')) networkId = 'monetag';
-          else if (netLower.includes('applixir')) networkId = 'applixir';
-          else if (netLower.includes('adsterra')) networkId = 'adsterra';
-        }
-      }
-    } catch {
-      // Downstream parameter validation handles missing fields safely
+  // Strictly bind ymid (sessionId) to server-created adSessions/{sessionId}
+  if (sessionId) {
+    const sessSnap = await db.collection('adSessions').doc(sessionId).get();
+    if (!sessSnap.exists) {
+      res.status(404).json({ ok: false, error: 'SESSION_NOT_FOUND' });
+      return;
+    }
+    const sess = sessSnap.data()!;
+    const boundUserId = typeof sess.userId === 'string' ? String(sess.userId).trim() : '';
+    const boundAdId = typeof sess.adId === 'string' ? String(sess.adId).trim() : '';
+
+    if (userId && boundUserId && userId !== boundUserId) {
+      res.status(403).json({ ok: false, error: 'SESSION_MISMATCH' });
+      return;
+    }
+    if (adId && boundAdId && adId !== boundAdId) {
+      res.status(403).json({ ok: false, error: 'SESSION_MISMATCH' });
+      return;
+    }
+
+    if (boundUserId) userId = boundUserId;
+    if (boundAdId) adId = boundAdId;
+    if (!networkId && typeof sess.adNetwork === 'string') {
+      const netLower = String(sess.adNetwork).toLowerCase();
+      if (netLower.includes('monetag')) networkId = 'monetag';
+      else if (netLower.includes('applixir')) networkId = 'applixir';
+      else if (netLower.includes('adsterra')) networkId = 'adsterra';
     }
   }
 
@@ -1631,6 +1635,7 @@ export const verifyAdSessionReward = onRequest({ cors: true }, async (req, res) 
 
     // Surface definitive provider/policy rejections immediately instead of timing out
     const terminalReasons = new Set([
+      'MONETAG_EVENT_NON_VALUED',
       'MONETAG_EVENT_NOT_VALUED',
       'APPLIXIR_STATUS_NOT_COMPLETED',
       'NETWORK_DISABLED',
@@ -1674,11 +1679,19 @@ export const verifyAdSessionReward = onRequest({ cors: true }, async (req, res) 
     const placementVal = isDailyBonus
       ? String(adOrBonusData.monetagDirectLinkUrl || '')
       : String(adOrBonusData.placementOrUrl || '');
+    const adNetLower = adNetworkName.toLowerCase();
     const isAppLixir =
-      adNetworkName.toLowerCase().includes('applixir') || /^applixir:/i.test(placementVal.trim());
+      adNetLower.includes('applixir') || /^applixir:/i.test(placementVal.trim());
+    const isMonetag = adNetLower.includes('monetag');
+    const requiresS2SPostback =
+      isAppLixir ||
+      isMonetag ||
+      isDailyBonus ||
+      adOrBonusData.rewardVerificationMethod === 's2s_postback' ||
+      adOrBonusData.adType === 'direct_link';
 
-    // AppLixir strictly requires MD5+TID S2S callback; never credit without callback
-    if (isAppLixir) {
+    // S2S Postback networks (Monetag, AppLixir, Direct Links, Daily Bonus) MUST wait for verified S2S Postback
+    if (requiresS2SPostback) {
       res.status(200).json({
         ok: true,
         status: 'pending',
@@ -4523,13 +4536,12 @@ function buildServerDailyBonusLaunchUrl(
   try {
     const resolved = trimmed
       .replace(/\{sessionId\}|\{session_id\}|\{ymid\}/gi, encodeURIComponent(sessionId))
-      .replace(/\{userId\}|\{user_id\}|\{subid\}/gi, encodeURIComponent(userId))
+      .replace(/\{userId\}|\{user_id\}|\{var\}|\{request_var\}/gi, encodeURIComponent(userId))
       .replace(/\{adId\}|\{ad_id\}/gi, encodeURIComponent(DAILY_CHECKIN_BONUS_AD_ID));
     const url = new URL(resolved);
     if (url.protocol !== 'https:') return null;
-    if (!url.searchParams.has('session_id')) url.searchParams.set('session_id', sessionId);
     if (!url.searchParams.has('ymid')) url.searchParams.set('ymid', sessionId);
-    if (!url.searchParams.has('subid')) url.searchParams.set('subid', userId);
+    if (!url.searchParams.has('var')) url.searchParams.set('var', userId);
     return url.toString();
   } catch {
     return null;
@@ -4652,6 +4664,7 @@ export const startDailyBonusSession = onRequest({ cors: true }, async (req, res)
     res.status(200).json({
       ok: true,
       sessionId,
+      ymid: sessionId,
       adId: DAILY_CHECKIN_BONUS_AD_ID,
       dhakaDate: dhakaToday,
       rewardPoints,

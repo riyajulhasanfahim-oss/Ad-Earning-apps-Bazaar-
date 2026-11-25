@@ -96,6 +96,9 @@ async function emitAuthSecurityTelemetry(
     | 'password_reset_requested',
   emailHint = '',
 ): Promise<void> {
+  if (import.meta.env.VITE_ENABLE_CLOUD_FUNCTIONS_FALLBACK !== 'true') {
+    return;
+  }
   try {
     const endpoint = `https://us-central1-${firebaseConfig.projectId}.cloudfunctions.net/recordAuthSecurityEvent`;
     const [idToken, appCheckHeaders] = await Promise.all([
