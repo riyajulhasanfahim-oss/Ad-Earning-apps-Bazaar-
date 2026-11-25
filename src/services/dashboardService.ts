@@ -5,7 +5,6 @@ import {
   getDoc,
   getDocFromServer,
   getDocsFromServer,
-  increment,
   limit,
   onSnapshot,
   query,
@@ -418,12 +417,15 @@ export function subscribeToDailyAdLimit(
   onError: (err: Error) => void,
 ): () => void {
   const todayDhaka = getDhakaDateKey();
-  const docId = `${uid}_${todayDhaka}`;
-  const path = `dailyAdLimits/${docId}`;
+  const path = `dailyAdLimits`;
+  const q = query(collection(db, 'dailyAdLimits'), where('userId', '==', uid));
   return onSnapshot(
-    doc(db, 'dailyAdLimits', docId),
+    q,
     (snap) => {
-      if (!snap.exists()) {
+      const match =
+        snap.docs.find((d) => d.id === `${uid}_${todayDhaka}`) ||
+        snap.docs.find((d) => String(d.data()?.dhakaDate || '') === todayDhaka);
+      if (!match) {
         onData({
           userId: uid,
           dhakaDate: todayDhaka,
@@ -433,7 +435,7 @@ export function subscribeToDailyAdLimit(
         });
         return;
       }
-      const data = snap.data();
+      const data = match.data();
       onData({
         userId: String(data.userId || uid),
         dhakaDate: String(data.dhakaDate || todayDhaka),
@@ -446,7 +448,7 @@ export function subscribeToDailyAdLimit(
     },
     (error) => {
       try {
-        handleFirestoreError(error, OperationType.GET, path);
+        handleFirestoreError(error, OperationType.LIST, path);
       } catch (wrapped) {
         onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
       }
@@ -1007,7 +1009,7 @@ async function fetchBackendEndpointWithFallback(
         signal: apiController.signal,
       });
       const contentType = apiResp.headers.get('content-type') || '';
-      if (apiResp.status === 404 && !contentType.includes('application/json')) {
+      if (!contentType.includes('application/json')) {
         vercelApiMissingCache.add(functionName);
         return null;
       }
@@ -1152,25 +1154,35 @@ async function verifyAndCreditAdRewardViaAdminFirestore(
     const walletSettingsRef = doc(db, 'appSettings', 'wallet');
     const economyRef = doc(db, 'appConfig', 'economy');
 
+    let todayDailyLimitExists = false;
+    if (!isDailyBonus) {
+      const existingLimitsSnap = await getDocsFromServer(
+        query(collection(db, 'dailyAdLimits'), where('userId', '==', uid)),
+      ).catch(() => null);
+      todayDailyLimitExists = Boolean(
+        existingLimitsSnap?.docs.some((d) => d.id === `${uid}_${dhakaToday}`),
+      );
+    }
+
     const outcome = await runTransaction(db, async (txn) => {
       const [
-        completionSnap,
         txSessionSnap,
         userSnap,
         walletSnap,
         txAdOrBonusSnap,
         dailyOrBonusUserSnap,
-        txDocSnap,
         walletSettingsSnap,
         economySnap,
       ] = await Promise.all([
-        txn.get(completionRef),
         txn.get(sessionRef),
         txn.get(userRef),
         txn.get(walletRef),
         txn.get(isDailyBonus ? doc(db, 'appSettings', 'dailyBonus') : doc(db, 'advertisements', adId)),
-        txn.get(isDailyBonus ? dailyBonusUserRef : dailyLimitRef),
-        txn.get(txRef),
+        isDailyBonus
+          ? txn.get(dailyBonusUserRef)
+          : todayDailyLimitExists
+            ? txn.get(dailyLimitRef)
+            : Promise.resolve(null),
         txn.get(walletSettingsRef),
         txn.get(economyRef),
       ]);
@@ -1187,7 +1199,6 @@ async function verifyAndCreditAdRewardViaAdminFirestore(
       const fallbackDailyBonusPoints = Number(ws.dailyBonusPoints ?? ec.dailyBonusPoints ?? 0);
 
       if (!earningEnabled) throw new Error('EARNING_DISABLED');
-      if (completionSnap.exists() || txDocSnap.exists()) throw new Error('DUPLICATE_PROVIDER_TX');
       if (!txSessionSnap.exists()) throw new Error('SESSION_NOT_FOUND');
       const liveSession = txSessionSnap.data();
       if (liveSession.userId !== uid || liveSession.adId !== adId) {
@@ -1215,7 +1226,8 @@ async function verifyAndCreditAdRewardViaAdminFirestore(
         if (bonusCfg.incentivizedTrafficAllowed !== true) {
           throw new Error('INCENTIVIZED_TRAFFIC_DISALLOWED');
         }
-        const prevBonus = dailyOrBonusUserSnap.exists() ? dailyOrBonusUserSnap.data() : {};
+        const prevBonus =
+          dailyOrBonusUserSnap && dailyOrBonusUserSnap.exists() ? dailyOrBonusUserSnap.data() : {};
         const lastClaimDate = String(prevBonus.lastClaimDate || '');
         if (lastClaimDate === dhakaToday) {
           throw new Error('DAILY_BONUS_ALREADY_CLAIMED');
@@ -1241,7 +1253,10 @@ async function verifyAndCreditAdRewardViaAdminFirestore(
           throw new Error('INCENTIVIZED_TRAFFIC_DISALLOWED');
         }
 
-        const existingDaily = dailyOrBonusUserSnap.exists() ? dailyOrBonusUserSnap.data() : null;
+        const existingDaily =
+          dailyOrBonusUserSnap && dailyOrBonusUserSnap.exists()
+            ? dailyOrBonusUserSnap.data()
+            : null;
         currentCount = Number(existingDaily?.completedCount || 0);
         currentEarned = Number(existingDaily?.earnedPoints || 0);
         completedAdIds = Array.isArray(existingDaily?.completedAdIds)
@@ -1383,7 +1398,7 @@ async function verifyAndCreditAdRewardViaAdminFirestore(
         txn.update(userRef, {
           points: newAvailablePoints,
           totalEarnings: prevTotalEarned + rewardPoints,
-          totalAdViews: increment(1),
+          totalAdViews: Number(userData.totalAdViews || 0) + 1,
         });
       }
 

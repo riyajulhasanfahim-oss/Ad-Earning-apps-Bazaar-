@@ -775,14 +775,14 @@ service cloud.firestore {
 
     // 3. Immutable Wallet Ledger (Strictly server/admin written; owner & support read-only)
     match /walletLedger/{entryId} {
-      allow get: if isValidId(entryId) && isSignedIn() && (existing().userId == request.auth.uid || isSupportAdmin());
+      allow get: if isValidId(entryId) && isSignedIn() && (isSupportAdmin() || (resource != null && existing().userId == request.auth.uid));
       allow list: if isSignedIn() && (existing().userId == request.auth.uid || isSupportAdmin());
       allow create, update, delete: if isValidId(entryId) && isAdmin();
     }
 
     // 4. Withdrawal Requests (Server-validated reservation; owner & support read-only)
     match /withdrawalRequests/{requestId} {
-      allow get: if isValidId(requestId) && isSignedIn() && (existing().userId == request.auth.uid || isSupportAdmin());
+      allow get: if isValidId(requestId) && isSignedIn() && (isSupportAdmin() || (resource != null && existing().userId == request.auth.uid));
       allow list: if isSignedIn() && (existing().userId == request.auth.uid || isSupportAdmin());
       allow create, update, delete: if isValidId(requestId) && isAdmin();
     }
@@ -851,7 +851,7 @@ service cloud.firestore {
     match /referrals/{referredUid} {
       allow get: if isValidId(referredUid) &&
         isSignedIn() &&
-        (existing().referrerUid == request.auth.uid || existing().referredUid == request.auth.uid || isSupportAdmin());
+        (isSupportAdmin() || (resource == null && isOwner(referredUid)) || (resource != null && (existing().referrerUid == request.auth.uid || existing().referredUid == request.auth.uid)));
 
       allow list: if isSignedIn() && (existing().referrerUid == request.auth.uid || isSupportAdmin());
 
@@ -882,7 +882,7 @@ service cloud.firestore {
     match /referralRewards/{rewardId} {
       allow get: if isValidId(rewardId) &&
         isSignedIn() &&
-        (existing().referrerUid == request.auth.uid || existing().referredUid == request.auth.uid || isSupportAdmin());
+        (isSupportAdmin() || (resource == null && isOwner(rewardId)) || (resource != null && (existing().referrerUid == request.auth.uid || existing().referredUid == request.auth.uid)));
       allow list: if isSignedIn() && (existing().referrerUid == request.auth.uid || existing().referredUid == request.auth.uid || isSupportAdmin());
       allow create, update, delete: if isValidId(rewardId) && isAdmin();
     }
@@ -929,7 +929,7 @@ service cloud.firestore {
 
     // 10. Admin-Controlled Advertisements (Only active ads visible to regular users)
     match /advertisements/{adId} {
-      allow get: if isValidId(adId) && isEmailVerified() && (existing().status == 'active' || isSupportAdmin());
+      allow get: if isValidId(adId) && isEmailVerified() && (isSupportAdmin() || (resource != null && existing().status == 'active'));
       allow list: if isEmailVerified() && (existing().status == 'active' || isSupportAdmin());
       allow create: if isValidId(adId) &&
         isAdmin() &&
@@ -962,7 +962,7 @@ service cloud.firestore {
 
     // 11. Ad Watching Sessions (Users can only initiate pending sessions; completion is server-only)
     match /adSessions/{sessionId} {
-      allow get: if isValidId(sessionId) && isSignedIn() && (existing().userId == request.auth.uid || isSupportAdmin());
+      allow get: if isValidId(sessionId) && isSignedIn() && (isSupportAdmin() || (resource != null && existing().userId == request.auth.uid));
       allow list: if isSignedIn() && (existing().userId == request.auth.uid || isSupportAdmin());
       allow create: if isValidId(sessionId) &&
         isEmailVerified() &&
@@ -1006,21 +1006,21 @@ service cloud.firestore {
 
     // 12. Server-Verified Idempotent Ad Completions (Read-only for owner & support)
     match /adCompletions/{completionId} {
-      allow get: if isValidId(completionId) && isSignedIn() && (existing().userId == request.auth.uid || isSupportAdmin());
+      allow get: if isValidId(completionId) && isSignedIn() && (isSupportAdmin() || (resource != null && existing().userId == request.auth.uid));
       allow list: if isSignedIn() && (existing().userId == request.auth.uid || isSupportAdmin());
       allow create, update, delete: if isValidId(completionId) && isAdmin();
     }
 
     // 13. Daily Ad Limits (Asia/Dhaka counters, read-only for owner & support)
     match /dailyAdLimits/{limitId} {
-      allow get: if isValidId(limitId) && isSignedIn() && (existing().userId == request.auth.uid || isSupportAdmin());
+      allow get: if isValidId(limitId) && isSignedIn() && (isSupportAdmin() || (resource == null && limitId.matches('^' + request.auth.uid + '_[0-9]{4}-[0-9]{2}-[0-9]{2}$')) || (resource != null && existing().userId == request.auth.uid));
       allow list: if isSignedIn() && (existing().userId == request.auth.uid || isSupportAdmin());
       allow create, update, delete: if isValidId(limitId) && isAdmin();
     }
 
     // 14. Server-Governed Transactions Ledger (Read-only for owner & support)
     match /transactions/{txId} {
-      allow get: if isValidId(txId) && isSignedIn() && (existing().userId == request.auth.uid || isSupportAdmin());
+      allow get: if isValidId(txId) && isSignedIn() && (isSupportAdmin() || (resource != null && existing().userId == request.auth.uid));
       allow list: if isSignedIn() && (existing().userId == request.auth.uid || isSupportAdmin());
       allow create, update, delete: if isValidId(txId) && isAdmin();
     }
@@ -1065,7 +1065,7 @@ service cloud.firestore {
 
     // 17. User Notifications
     match /notifications/{notifId} {
-      allow get: if isValidId(notifId) && isSignedIn() && (existing().userId == request.auth.uid || isAdmin());
+      allow get: if isValidId(notifId) && isSignedIn() && (isAdmin() || (resource != null && existing().userId == request.auth.uid));
       allow list: if isSignedIn() && (existing().userId == request.auth.uid || isAdmin());
       allow create, delete: if isValidId(notifId) && isAdmin();
       allow update: if isValidId(notifId) &&
@@ -1213,7 +1213,7 @@ service cloud.firestore {
 
     // 29. Admin-Managed Multi Direct Link Ads (Active slots readable for placement display; Admin-only write; zero fake rewards)
     match /directLinkAds/{linkId} {
-      allow get: if isValidId(linkId) && (existing().status == 'active' || isSupportAdmin());
+      allow get: if isValidId(linkId) && (isSupportAdmin() || (resource != null && existing().status == 'active'));
       allow list: if existing().status == 'active' || isSupportAdmin();
       allow create: if isValidId(linkId) &&
         isAdmin() &&
